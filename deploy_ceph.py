@@ -315,37 +315,59 @@ def get_container_image(version: str) -> str:
 # =============================================================================
 
 class SSHManager:
-    """Manage SSH keys for cluster deployment."""
+    """Manage SSH keys with support for multiple key types."""
     
     def __init__(self, key_path: str = None, user: str = "root"):
         self.user = user
-        self.key_path = Path(key_path) if key_path else Path.home() / ".ssh" / "id_rsa"
+        # Try to find an existing key if none provided
+        if key_path:
+            self.key_path = Path(key_path).expanduser()
+        else:
+            self.key_path = self._detect_existing_key()
+            
         self.pub_key_path = Path(f"{self.key_path}.pub")
     
+    def _detect_existing_key(self) -> Path:
+        """Detect the first available standard SSH key."""
+        ssh_dir = Path.home() / ".ssh"
+        # Priorities: Ed25519 is modern/preferred, then RSA
+        for key_name in ["id_ed25519", "id_ecdsa", "id_rsa"]:
+            path = ssh_dir / key_name
+            if path.exists():
+                return path
+        # Fallback to default if nothing found
+        return ssh_dir / "id_rsa"
+
     def key_exists(self) -> bool:
-        """Check if SSH key pair exists."""
+        """Check if both private and public key parts exist."""
         return self.key_path.exists() and self.pub_key_path.exists()
-    
+
     def generate_key(self, comment: str = "ceph-deploy") -> bool:
-        """Generate new SSH key pair if not exists."""
+        """Generate a modern Ed25519 key pair if none exists."""
         if self.key_exists():
-            print_status(f"SSH key already exists: {self.key_path}", "SKIP")
+            print_status(f"Using existing key: {self.key_path}", "SKIP")
             return True
         
-        print_status(f"Generating SSH key: {self.key_path}")
+        # Guard: If private exists but pub is missing, don't overwrite
+        if self.key_path.exists():
+            print_status(f"Private key {self.key_path} exists but .pub is missing. Script will not overwrite.", "FAIL")
+            return False
+
+        print_status(f"Generating new Ed25519 key: {self.key_path}")
         self.key_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         
         try:
+            # We use ed25519 now as it is the modern standard seen in your logs
             run_cmd([
-                "ssh-keygen", "-t", "rsa", "-b", "4096",
+                "ssh-keygen", "-t", "ed25519",
                 "-f", str(self.key_path),
-                "-N", "",  # No passphrase
+                "-N", "", 
                 "-C", comment
             ])
-            print_status("SSH key generated", "OK")
+            print_status("Key generated", "OK")
             return True
         except Exception as e:
-            print_status(f"Failed to generate SSH key: {e}", "FAIL")
+            print_status(f"Failed to generate key: {e}", "FAIL")
             return False
     
     def get_public_key(self) -> str:
