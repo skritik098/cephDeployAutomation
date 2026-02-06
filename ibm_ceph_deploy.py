@@ -590,6 +590,12 @@ def install_packages(host: str, is_bootstrap: bool = False) -> bool:
     """
     Install required packages on a host.
     
+    IMPORTANT: ibm-storage-ceph-license must be installed and accepted BEFORE
+    cephadm can be installed. The sequence is:
+    1. Install ibm-storage-ceph-license
+    2. Accept the license agreement
+    3. Install remaining packages (including cephadm on bootstrap)
+    
     Args:
         host: Target hostname
         is_bootstrap: Whether this is the bootstrap node
@@ -599,15 +605,36 @@ def install_packages(host: str, is_bootstrap: bool = False) -> bool:
     """
     log_info(f"Checking packages on {host}...")
     
-    # Base packages for all nodes
+    # Check if license package is installed
+    license_result = run_command(
+        "rpm -q ibm-storage-ceph-license &>/dev/null && echo 'installed' || echo 'missing'",
+        host=host,
+        capture_output=True,
+        check=False
+    )
+    license_installed = "installed" in license_result.stdout
+    
+    # Step 1: Install and accept license first (required before cephadm)
+    if not license_installed:
+        log_info(f"  Installing ibm-storage-ceph-license on {host}...")
+        run_command("dnf install -y ibm-storage-ceph-license | tail -n5", host=host, timeout=300)
+    
+    # Step 2: Accept IBM license (must be done before installing cephadm)
+    log_info(f"  Accepting IBM license agreement on {host}...")
+    run_command(
+        "mkdir -p /usr/share/ibm-storage-ceph-license && "
+        "touch /usr/share/ibm-storage-ceph-license/accept",
+        host=host
+    )
+    
+    # Step 3: Define remaining packages to install
     packages = [
         "podman",
         "lvm2",
         "chrony",
-        "ibm-storage-ceph-license",
     ]
     
-    # Bootstrap node gets cephadm
+    # Bootstrap node gets cephadm (can only be installed after license is accepted)
     if is_bootstrap:
         packages.append("cephadm")
     
@@ -623,29 +650,17 @@ def install_packages(host: str, is_bootstrap: bool = False) -> bool:
         if "missing" in result.stdout:
             missing_packages.append(pkg)
     
-    if not missing_packages:
+    if not missing_packages and license_installed:
         log_info(f"  ⏭ All packages already installed on {host}, skipping")
-        # Still ensure license is accepted and chronyd is running
-        run_command(
-            "mkdir -p /usr/share/ibm-storage-ceph-license && "
-            "touch /usr/share/ibm-storage-ceph-license/accept",
-            host=host
-        )
+        # Still ensure chronyd is running
         run_command("systemctl enable --now chronyd 2>/dev/null || true", host=host)
         return False
     
-    log_info(f"  Installing {len(missing_packages)} packages on {host}: {', '.join(missing_packages)}")
-    
-    # Install missing packages
-    pkg_list = " ".join(missing_packages)
-    run_command(f"dnf install -y {pkg_list}", host=host, timeout=600)
-    
-    # Accept IBM license
-    run_command(
-        "mkdir -p /usr/share/ibm-storage-ceph-license && "
-        "touch /usr/share/ibm-storage-ceph-license/accept",
-        host=host
-    )
+    # Step 4: Install remaining packages
+    if missing_packages:
+        log_info(f"  Installing packages on {host}: {', '.join(missing_packages)}")
+        pkg_list = " ".join(missing_packages)
+        run_command(f"dnf install -y {pkg_list} | tail -n5", host=host, timeout=600)
     
     # Enable and start chronyd for time sync
     run_command("systemctl enable --now chronyd", host=host)
@@ -658,6 +673,9 @@ def install_client_packages(host: str) -> bool:
     """
     Install ceph-common package on a client node.
     
+    IMPORTANT: ibm-storage-ceph-license must be installed and accepted BEFORE
+    ceph-common can be installed.
+    
     Args:
         host: Target hostname
     
@@ -666,24 +684,46 @@ def install_client_packages(host: str) -> bool:
     """
     log_info(f"Checking client packages on {host}...")
     
+    # Check if license is installed
+    license_result = run_command(
+        "rpm -q ibm-storage-ceph-license &>/dev/null && echo 'installed' || echo 'missing'",
+        host=host,
+        capture_output=True,
+        check=False
+    )
+    license_installed = "installed" in license_result.stdout
+    
     # Check if ceph-common is already installed
-    result = run_command(
+    ceph_result = run_command(
         "rpm -q ceph-common &>/dev/null && echo 'installed' || echo 'missing'",
         host=host,
         capture_output=True,
         check=False
     )
+    ceph_installed = "installed" in ceph_result.stdout
     
-    if "installed" in result.stdout:
-        log_info(f"  ⏭ ceph-common already installed on {host}, skipping")
+    if license_installed and ceph_installed:
+        log_info(f"  ⏭ Client packages already installed on {host}, skipping")
         return False
     
-    log_info(f"  Installing ceph-common on {host}...")
+    # Step 1: Install and accept license first (required before ceph-common)
+    if not license_installed:
+        log_info(f"  Installing ibm-storage-ceph-license on {host}...")
+        run_command("dnf install -y ibm-storage-ceph-license | tail -n5", host=host, timeout=300)
     
-    # Install ceph-common package
-    run_command("dnf install -y ceph-common", host=host, timeout=300)
+    # Step 2: Accept IBM license
+    run_command(
+        "mkdir -p /usr/share/ibm-storage-ceph-license && "
+        "touch /usr/share/ibm-storage-ceph-license/accept",
+        host=host
+    )
     
-    log_info(f"  ✓ ceph-common installed on {host}")
+    # Step 3: Install ceph-common
+    if not ceph_installed:
+        log_info(f"  Installing ceph-common on {host}...")
+        run_command("dnf install -y ceph-common | tail -n5", host=host, timeout=300)
+    
+    log_info(f"  ✓ Client packages installed on {host}")
     return True
 
 
