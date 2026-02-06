@@ -1,109 +1,231 @@
-# IBM Storage Ceph Deployment Tool
+# IBM Storage Ceph Automated Deployment Tool
 
-Single-script deployment tool for IBM Storage Ceph clusters using cephadm.
+Automates end-to-end deployment of IBM Storage Ceph clusters on RHEL-based systems.
 
 ## Features
 
-- **OS-aware version listing**: Shows compatible versions for your OS
-- **SSH setup**: Automated key generation and distribution  
-- **Flexible topology**: MON/MGR/OSD placement via labels
-- **OSD options**: Auto-deploy all devices or skip for manual config
+- **OS Version Validation**: Ensures RHEL version matches IBM's supported configuration matrix
+- **Automatic Container Image Selection**: Selects correct IBM Storage Ceph container image based on version and OS
+- **SSH Passwordless Setup**: Optional automatic SSH key distribution for root user
+- **Multi-Version Support**: Supports IBM Storage Ceph major versions 5, 6, 7, 8 (latest release in each stream)
+- **HA Configuration**: Deploys 3 MONs and 3 MGRs (when 3+ hosts available)
+- **Automatic OSD Deployment**: Uses cephadm's `--all-available-devices` (optional)
+- **Dashboard & Monitoring**: Full monitoring stack with Prometheus, Grafana, Alertmanager
 
-## Requirements
+## Container Image Mapping
 
-- Python 3.9+ with PyYAML (`pip install pyyaml`)
-- Target nodes: RHEL/Rocky/AlmaLinux 8.x or 9.x
-- IBM Entitlement Key from https://myibm.ibm.com/products-services/containerlibrary
-- (Optional) `sshpass` for automated SSH key distribution
+The script automatically selects the correct container image based on your Ceph major version and RHEL version. Using `:latest` tag pulls the most recent release in that major version stream.
 
-## Quick Start
+| Ceph Version | RHEL 9 Image | RHEL 8 Image |
+|-------------|--------------|--------------|
+| **8** | `cp.icr.io/cp/ibm-ceph/ceph-8-rhel9:latest` | N/A |
+| **7** | `cp.icr.io/cp/ibm-ceph/ceph-7-rhel9:latest` | `cp.icr.io/cp/ibm-ceph/ceph-7-rhel8:latest` |
+| **6** | `cp.icr.io/cp/ibm-ceph/ceph-6-rhel9:latest` | `cp.icr.io/cp/ibm-ceph/ceph-6-rhel8:latest` |
+| **5** | `cp.icr.io/cp/ibm-ceph/ceph-5-rhel9:latest` | `cp.icr.io/cp/ibm-ceph/ceph-5-rhel8:latest` |
 
-```bash
-# 1. Check compatible versions for your OS
-./deploy_ceph.py list-versions
+## Version Compatibility Matrix
 
-# 2. Generate hosts file
-./deploy_ceph.py generate-hosts --nodes 3 -o hosts.yml
-# Edit hosts.yml with your IPs
+| Ceph Version | RHEL 9 Supported | RHEL 8 Supported | Notes |
+|-------------|------------------|------------------|-------|
+| **8** | 9.4, 9.5, 9.6 | ❌ | Latest GA |
+| **7** | 9.2 - 9.6 | 8.7, 8.8, 8.10* | |
+| **6** | 9.2 - 9.5 | 8.8 - 8.10* | |
+| **5** | 9.0 - 9.2 | 8.6 - 8.8 | |
 
-# 3. Setup SSH access
-./deploy_ceph.py setup-ssh --hosts hosts.yml --prompt-password
+*RHEL 8 deployments require RHEL 9 bootstrap node for versions 6 and 7
 
-# 4. Deploy cluster
-./deploy_ceph.py deploy --hosts hosts.yml --version 8.0 --registry-password <KEY>
-```
+## Prerequisites
 
-## Commands
+1. **RHEL Subscription**: All nodes must be registered with Red Hat
+2. **IBM Entitlement Key**: Obtain from [MyIBM Container Library](https://myibm.ibm.com/products-services/containerlibrary)
+3. **Network Connectivity**: All nodes must be reachable from the admin workstation
+4. **Root Access**: Script requires root privileges on all nodes
 
-```bash
-# List versions with OS compatibility check
-./deploy_ceph.py list-versions
-
-# Setup SSH keys (generates + distributes)
-./deploy_ceph.py setup-ssh --hosts hosts.yml --prompt-password
-
-# Run preflight checks
-./deploy_ceph.py preflight --version 8.0 --prepare
-
-# Deploy cluster
-./deploy_ceph.py deploy --hosts hosts.yml --version 8.0 --registry-password <KEY>
-
-# Deploy without OSDs
-./deploy_ceph.py deploy --hosts hosts.yml --version 7.1 --skip-osd --registry-password <KEY>
-
-# Check cluster status
-./deploy_ceph.py status
-```
-
-## Environment Variable
+## Installation
 
 ```bash
-export IBM_ENTITLEMENT_KEY="your-key-here"
+# Make the script executable
+chmod +x ibm_ceph_deploy.py
+
+# Verify Python 3 is available
+python3 --version
 ```
 
-## Hosts File Format
+## Usage
 
-```yaml
-# Simple format with labels
-- hostname: ceph-node1
-  addr: 192.168.1.11
-  labels: [mon, mgr, osd]
+### Basic Deployment
 
-- hostname: ceph-node2
-  addr: 192.168.1.12
-  labels: [mon, mgr, osd]
-
-- hostname: ceph-node3
-  addr: 192.168.1.13
-  labels: [mon, osd]
-  osd_devices:        # Optional: specific devices
-    - /dev/sdb
-    - /dev/sdc
+```bash
+./ibm_ceph_deploy.py \
+  --inventory hosts_inventory.txt \
+  --ceph-version 7 \
+  --entitlement-key <YOUR_IBM_ENTITLEMENT_KEY>
 ```
 
-Labels determine service placement:
-- `mon` - Monitor (3 or 5 recommended)
-- `mgr` - Manager (2-3 for HA)
-- `osd` - Storage nodes
+### With SSH Setup
 
-## Supported Versions
+If SSH passwordless isn't configured yet:
 
-| IBM Ceph | Upstream | RHEL Support |
-|----------|----------|--------------|
-| 8.0 | Squid 19.x | 9.4, 9.5, 9.6 |
-| 7.1 | Reef 18.x | 8.8-8.10, 9.2, 9.4 |
-| 7.0 | Reef 18.x | 8.6-8.8, 9.0, 9.2 |
-| 6.1 | Quincy 17.x | 8.4-8.8, 9.0, 9.2 |
+```bash
+./ibm_ceph_deploy.py \
+  --inventory hosts_inventory.txt \
+  --ceph-version 8 \
+  --entitlement-key <YOUR_IBM_ENTITLEMENT_KEY> \
+  --setup-ssh \
+  --ssh-password <CURRENT_ROOT_PASSWORD>
+```
 
-## Workflow
+### With Cluster Network
 
-1. **list-versions** - See what's compatible with your OS
-2. **generate-hosts** - Create hosts.yml template
-3. **setup-ssh** - Configure passwordless SSH
-4. **preflight** - Check/prepare nodes
-5. **deploy** - Bootstrap and configure cluster
-6. **status** - Verify deployment
+For dedicated cluster traffic (replication, recovery):
+
+```bash
+./ibm_ceph_deploy.py \
+  --inventory hosts_inventory.txt \
+  --ceph-version 7 \
+  --entitlement-key <YOUR_IBM_ENTITLEMENT_KEY> \
+  --cluster-network 10.10.0.0/24
+```
+
+### Skip OSD Deployment
+
+Deploy cluster without OSDs (configure manually later):
+
+```bash
+./ibm_ceph_deploy.py \
+  --inventory hosts_inventory.txt \
+  --ceph-version 7 \
+  --entitlement-key <YOUR_IBM_ENTITLEMENT_KEY> \
+  --skip-osd
+```
+
+## Inventory File Format
+
+Create a text file with one host per line. The **first host** is the bootstrap node.
+
+### Simple Format
+```
+ceph-node1
+ceph-node2
+ceph-node3
+```
+
+### With IP Addresses
+```
+ceph-node1,192.168.1.101
+ceph-node2,192.168.1.102
+ceph-node3,192.168.1.103
+```
+
+### JSON Format
+```json
+[
+  {"hostname": "ceph-node1", "ip": "192.168.1.101"},
+  {"hostname": "ceph-node2", "ip": "192.168.1.102"},
+  {"hostname": "ceph-node3", "ip": "192.168.1.103"}
+]
+```
+
+## Command Line Options
+
+| Option | Required | Description |
+|--------|----------|-------------|
+| `--inventory, -i` | Yes | Path to hosts inventory file |
+| `--ceph-version, -v` | Yes | IBM Storage Ceph major version (5, 6, 7, 8) - deploys latest in that stream |
+| `--entitlement-key, -k` | Yes | IBM entitlement key for container registry |
+| `--setup-ssh` | No | Configure SSH passwordless authentication |
+| `--ssh-password` | No* | Root password for SSH setup (*required with --setup-ssh) |
+| `--cluster-network` | No | Cluster network CIDR (e.g., 10.10.0.0/24) |
+| `--skip-osd` | No | Skip automatic OSD deployment |
+| `--skip-firewall` | No | Skip firewall configuration |
+
+## Deployment Workflow
+
+The script performs these steps in order:
+
+1. **Parse Inventory** - Load and validate host list
+2. **SSH Setup** (optional) - Configure passwordless SSH for root
+3. **OS Validation** - Check RHEL version compatibility
+4. **Repository Config** - Add IBM Storage Ceph repos on all nodes
+5. **Package Install** - Install cephadm, podman, lvm2, license
+6. **Firewall Config** - Open required Ceph ports
+7. **Registry Login** - Authenticate to cp.icr.io on all nodes
+8. **Bootstrap** - Initialize cluster with cephadm bootstrap
+9. **Cluster Expansion** - Add remaining hosts, configure 3 MONs/MGRs
+10. **OSD Deployment** (optional) - Deploy OSDs on all available devices
+11. **Summary** - Display cluster status and dashboard credentials
+
+## Post-Deployment
+
+### Access Dashboard
+
+The script outputs the dashboard URL and credentials:
+```
+Dashboard URL:    https://192.168.1.101:8443/
+Dashboard User:   admin
+Dashboard Pass:   <generated_password>
+```
+
+### Manual OSD Configuration
+
+If you used `--skip-osd`, deploy OSDs manually:
+
+```bash
+# List available devices
+cephadm shell -- ceph orch device ls --wide
+
+# Deploy on all available devices
+cephadm shell -- ceph orch apply osd --all-available-devices
+
+# Or use a drive group spec for selective deployment
+cephadm shell -- ceph orch apply osd -i osd_spec.yml
+```
+
+### Useful Commands
+
+```bash
+# Cluster status
+cephadm shell -- ceph -s
+
+# OSD tree
+cephadm shell -- ceph osd tree
+
+# Service status
+cephadm shell -- ceph orch ls
+
+# Host status
+cephadm shell -- ceph orch host ls
+
+# Health details
+cephadm shell -- ceph health detail
+```
+
+## Troubleshooting
+
+### SSH Connection Failed
+- Verify hostname resolution: `getent hosts <hostname>`
+- Check SSH connectivity: `ssh root@<hostname>`
+- Ensure root login is permitted in `/etc/ssh/sshd_config`
+
+### OS Compatibility Error
+- The script validates RHEL versions against IBM's support matrix
+- Ensure all nodes run a supported RHEL version
+- For RHEL 8 clusters (Ceph 6.x/7.x), bootstrap node must be RHEL 9
+
+### Repository Issues
+- Verify RHEL subscription: `subscription-manager status`
+- Check repo availability: `dnf repolist`
+
+### Registry Authentication Failed
+- Verify entitlement key at [MyIBM](https://myibm.ibm.com/products-services/containerlibrary)
+- Test manually: `podman login cp.icr.io -u cp -p <key>`
+
+### Bootstrap Failures
+- Check `/var/log/ceph/cephadm.log` on the bootstrap node
+- Ensure time is synchronized: `chronyc tracking`
+- Verify network connectivity between nodes
 
 ## License
 
-Apache 2.0
+This tool is provided as-is for automating IBM Storage Ceph deployments.
+IBM Storage Ceph requires a valid IBM license and entitlement.
