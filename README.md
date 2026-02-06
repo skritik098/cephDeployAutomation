@@ -16,12 +16,12 @@ Automates end-to-end deployment of IBM Storage Ceph clusters on RHEL-based syste
 
 The script automatically selects the correct container image based on your Ceph major version and RHEL version. Using `:latest` tag pulls the most recent release in that major version stream.
 
-| Ceph Version | RHEL 9 Image | RHEL 8 Image |
-|-------------|--------------|--------------|
-| **8** | `cp.icr.io/cp/ibm-ceph/ceph-8-rhel9:latest` | N/A |
-| **7** | `cp.icr.io/cp/ibm-ceph/ceph-7-rhel9:latest` | `cp.icr.io/cp/ibm-ceph/ceph-7-rhel8:latest` |
-| **6** | `cp.icr.io/cp/ibm-ceph/ceph-6-rhel9:latest` | `cp.icr.io/cp/ibm-ceph/ceph-6-rhel8:latest` |
-| **5** | `cp.icr.io/cp/ibm-ceph/ceph-5-rhel9:latest` | `cp.icr.io/cp/ibm-ceph/ceph-5-rhel8:latest` |
+| Ceph Version | RHEL 9 Image | RHEL 8 Image | Notes |
+|-------------|--------------|--------------|-------|
+| **8** | `cp.icr.io/cp/ibm-ceph/ceph-8-rhel9:latest` | N/A | |
+| **7** | `cp.icr.io/cp/ibm-ceph/ceph-7-rhel9:latest` | `cp.icr.io/cp/ibm-ceph/ceph-7-rhel8:latest` | |
+| **6** | `cp.icr.io/cp/ibm-ceph/ceph-6-rhel9:latest` | `cp.icr.io/cp/ibm-ceph/ceph-6-rhel8:latest` | |
+| **5** | `cp.icr.io/cp/ibm-ceph/ceph-5-rhel8:latest` | `cp.icr.io/cp/ibm-ceph/ceph-5-rhel8:latest` | RHEL 8 image used for both |
 
 ## Version Compatibility Matrix
 
@@ -138,6 +138,7 @@ ceph-node3,192.168.1.103
 | `--cluster-network` | No | Cluster network CIDR (e.g., 10.10.0.0/24) |
 | `--skip-osd` | No | Skip automatic OSD deployment |
 | `--skip-firewall` | No | Skip firewall configuration |
+| `--force` | No | Continue with unsupported OS version (not recommended) |
 
 ## Deployment Workflow
 
@@ -145,15 +146,23 @@ The script performs these steps in order:
 
 1. **Parse Inventory** - Load and validate host list
 2. **SSH Setup** (optional) - Configure passwordless SSH for root
-3. **OS Validation** - Check RHEL version compatibility
-4. **Repository Config** - Add IBM Storage Ceph repos on all nodes
-5. **Package Install** - Install cephadm, podman, lvm2, license
-6. **Firewall Config** - Open required Ceph ports
-7. **Registry Login** - Authenticate to cp.icr.io on all nodes
+3. **OS Validation** - Check RHEL version compatibility (use `--force` to bypass)
+4. **Repository Config** - Add IBM Storage Ceph repos on all nodes (parallel, skips if exists)
+5. **Package Install** - Install cephadm, podman, lvm2, license (parallel, skips if installed)
+6. **Firewall Config** - Open required Ceph ports (parallel)
+7. **Registry Login** - Authenticate to cp.icr.io on all nodes (parallel)
 8. **Bootstrap** - Initialize cluster with cephadm bootstrap
 9. **Cluster Expansion** - Add remaining hosts, configure 3 MONs/MGRs
 10. **OSD Deployment** (optional) - Deploy OSDs on all available devices
 11. **Summary** - Display cluster status and dashboard credentials
+
+## Performance Optimizations
+
+The script includes several optimizations for faster deployments:
+
+- **Parallel Execution**: Repository configuration, package installation, firewall setup, and registry login run in parallel across all hosts (up to 5 concurrent operations)
+- **Skip-if-Exists**: Repositories and packages are checked before installation - already configured/installed items are skipped
+- **Idempotent Operations**: Safe to re-run if a deployment is interrupted
 
 ## Post-Deployment
 

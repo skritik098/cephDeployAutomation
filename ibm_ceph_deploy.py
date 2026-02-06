@@ -22,6 +22,7 @@ import os
 import json
 import time
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
@@ -65,6 +66,7 @@ IBM_REGISTRY_USERNAME = "cp"
 # Container image mapping for each IBM Storage Ceph major version
 # Image pattern: cp.icr.io/cp/ibm-ceph/ceph-{major}-rhel{rhel_major}:latest
 # Using :latest tag pulls the most recent release in that major version stream
+# Note: Ceph 5 only has RHEL 8 based images available
 CONTAINER_IMAGES = {
     "8": {
         "9": "cp.icr.io/cp/ibm-ceph/ceph-8-rhel9",
@@ -78,7 +80,8 @@ CONTAINER_IMAGES = {
         "8": "cp.icr.io/cp/ibm-ceph/ceph-6-rhel8",
     },
     "5": {
-        "9": "cp.icr.io/cp/ibm-ceph/ceph-5-rhel9",
+        # Ceph 5 only has RHEL 8 based images - use rhel8 image regardless of host OS
+        "9": "cp.icr.io/cp/ibm-ceph/ceph-5-rhel8",
         "8": "cp.icr.io/cp/ibm-ceph/ceph-5-rhel8",
     },
 }
@@ -185,6 +188,70 @@ def run_command(cmd: str, host: Optional[str] = None, check: bool = True,
         raise
 
 
+def run_command_streaming(cmd: str, host: Optional[str] = None, timeout: int = 900) -> tuple[int, str]:
+    """
+    Run a command with real-time streaming output while also capturing it.
+    
+    Args:
+        cmd: Command to execute
+        host: Remote hostname (None for local execution)
+        timeout: Command timeout in seconds
+    
+    Returns:
+        Tuple of (return_code, captured_output)
+    """
+    if host:
+        full_cmd = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@{host} '{cmd}'"
+    else:
+        full_cmd = cmd
+    
+    captured_output = []
+    
+    try:
+        # Use Popen for streaming output
+        process = subprocess.Popen(
+            full_cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # Merge stderr into stdout
+            text=True,
+            bufsize=1,  # Line buffered
+        )
+        
+        start_time = time.time()
+        
+        # Read and print output line by line
+        while True:
+            # Check timeout
+            if time.time() - start_time > timeout:
+                process.kill()
+                raise subprocess.TimeoutExpired(full_cmd, timeout)
+            
+            line = process.stdout.readline()
+            if line:
+                print(f"    {line}", end='')  # Print with indent
+                captured_output.append(line)
+            elif process.poll() is not None:
+                # Process finished, read any remaining output
+                remaining = process.stdout.read()
+                if remaining:
+                    print(f"    {remaining}", end='')
+                    captured_output.append(remaining)
+                break
+        
+        return_code = process.returncode
+        output_str = ''.join(captured_output)
+        
+        return (return_code, output_str)
+        
+    except subprocess.TimeoutExpired:
+        log_error(f"Command timed out after {timeout}s: {cmd}")
+        raise
+    except Exception as e:
+        log_error(f"Command execution failed: {e}")
+        raise
+
+
 def get_os_version(host: Optional[str] = None) -> str:
     """
     Get RHEL version from a host.
@@ -241,7 +308,8 @@ def get_host_ip(host: str) -> str:
         return host
 
 
-def validate_os_compatibility(ceph_version: str, os_version: str, is_bootstrap: bool = False) -> bool:
+def validate_os_compatibility(ceph_version: str, os_version: str, is_bootstrap: bool = False, 
+                              force: bool = False) -> tuple[bool, bool]:
     """
     Validate if the OS version is compatible with the Ceph version.
     
@@ -249,41 +317,67 @@ def validate_os_compatibility(ceph_version: str, os_version: str, is_bootstrap: 
         ceph_version: IBM Storage Ceph major version (e.g., "7")
         os_version: RHEL version (e.g., "9.4")
         is_bootstrap: Whether this is the bootstrap node
+        force: If True, continue with warning instead of failing
     
     Returns:
-        True if compatible, False otherwise
+        Tuple of (is_compatible: bool, is_warning: bool)
+        - is_compatible: True if compatible or force=True
+        - is_warning: True if compatibility issue was bypassed with force
     """
     if ceph_version not in VERSION_COMPATIBILITY:
         log_error(f"Unknown Ceph version: {ceph_version}")
         log_info(f"Supported versions: {', '.join(VERSION_COMPATIBILITY.keys())}")
-        return False
+        return (False, False)
     
     rhel_major = os_version.split('.')[0]
     compat = VERSION_COMPATIBILITY[ceph_version]
     
     # Check if RHEL major version is supported
     if rhel_major not in compat:
-        log_error(f"RHEL {rhel_major} is not supported for IBM Storage Ceph {ceph_version}")
+        msg = f"RHEL {rhel_major} is not supported for IBM Storage Ceph {ceph_version}"
         supported = [f"RHEL {k}" for k in compat.keys()]
-        log_info(f"Supported OS versions: {', '.join(supported)}")
-        return False
+        
+        if force:
+            log_warn(f"{msg} (continuing with --force)")
+            log_info(f"Supported OS versions: {', '.join(supported)}")
+            return (True, True)
+        else:
+            log_error(msg)
+            log_info(f"Supported OS versions: {', '.join(supported)}")
+            log_info("Use --force to continue anyway (not recommended)")
+            return (False, False)
     
     # Check specific minor version
     if os_version not in compat[rhel_major]:
-        log_error(f"RHEL {os_version} is not supported for IBM Storage Ceph {ceph_version}")
-        log_info(f"Supported RHEL {rhel_major} versions: {', '.join(compat[rhel_major])}")
-        return False
+        msg = f"RHEL {os_version} is not in the supported list for IBM Storage Ceph {ceph_version}"
+        
+        if force:
+            log_warn(f"{msg} (continuing with --force)")
+            log_info(f"Supported RHEL {rhel_major} versions: {', '.join(compat[rhel_major])}")
+            return (True, True)
+        else:
+            log_error(msg)
+            log_info(f"Supported RHEL {rhel_major} versions: {', '.join(compat[rhel_major])}")
+            log_info("Use --force to continue anyway (not recommended)")
+            return (False, False)
     
     # Check bootstrap node requirement for RHEL 8 clusters
     if rhel_major == "8" and ceph_version in RHEL9_BOOTSTRAP_REQUIRED:
         if is_bootstrap:
-            log_error(f"IBM Storage Ceph {ceph_version} requires RHEL 9 for the bootstrap node")
-            log_info("RHEL 8 nodes can only be added after bootstrapping from a RHEL 9 node")
-            return False
+            msg = f"IBM Storage Ceph {ceph_version} requires RHEL 9 for the bootstrap node"
+            if force:
+                log_warn(f"{msg} (continuing with --force)")
+                log_info("RHEL 8 bootstrap is not officially supported and may fail")
+                return (True, True)
+            else:
+                log_error(msg)
+                log_info("RHEL 8 nodes can only be added after bootstrapping from a RHEL 9 node")
+                log_info("Use --force to continue anyway (not recommended)")
+                return (False, False)
         else:
             log_warn(f"RHEL 8 node detected - ensure bootstrap node is RHEL 9")
     
-    return True
+    return (True, False)
 
 
 def get_container_image(ceph_version: str, rhel_major: str) -> str:
@@ -401,7 +495,7 @@ def setup_ssh_passwordless(hosts: list[HostInfo], ssh_password: str):
             raise
 
 
-def configure_repositories(host: str, ceph_version: str, rhel_major: str):
+def configure_repositories(host: str, ceph_version: str, rhel_major: str) -> bool:
     """
     Configure IBM Storage Ceph repositories on a host.
     
@@ -409,8 +503,35 @@ def configure_repositories(host: str, ceph_version: str, rhel_major: str):
         host: Target hostname
         ceph_version: Ceph major version (e.g., "7")
         rhel_major: RHEL major version (e.g., "9")
+    
+    Returns:
+        True if configuration was performed, False if skipped (already configured)
     """
-    log_info(f"Configuring repositories on {host}...")
+    log_info(f"Checking repositories on {host}...")
+    
+    # Check if IBM Ceph repo already exists
+    try:
+        result = run_command(
+            "ls /etc/yum.repos.d/ibm-storage-ceph*.repo 2>/dev/null | head -1",
+            host=host,
+            capture_output=True,
+            check=False
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            # Verify the repo is for the correct version
+            check_result = run_command(
+                f"grep -l 'ibm-storage-ceph-{ceph_version}' /etc/yum.repos.d/ibm-storage-ceph*.repo 2>/dev/null",
+                host=host,
+                capture_output=True,
+                check=False
+            )
+            if check_result.returncode == 0 and check_result.stdout.strip():
+                log_info(f"  ⏭ Repository already configured on {host}, skipping")
+                return False
+    except Exception:
+        pass
+    
+    log_info(f"  Configuring repositories on {host}...")
     
     # Repository URL (ceph_version is already the major version)
     repo_url = REPO_URL_TEMPLATE.format(major=ceph_version, rhel_major=rhel_major)
@@ -432,17 +553,21 @@ def configure_repositories(host: str, ceph_version: str, rhel_major: str):
         run_command(cmd, host=host)
     
     log_info(f"  ✓ Repositories configured on {host}")
+    return True
 
 
-def install_packages(host: str, is_bootstrap: bool = False):
+def install_packages(host: str, is_bootstrap: bool = False) -> bool:
     """
     Install required packages on a host.
     
     Args:
         host: Target hostname
         is_bootstrap: Whether this is the bootstrap node
+    
+    Returns:
+        True if installation was performed, False if skipped (already installed)
     """
-    log_info(f"Installing packages on {host}...")
+    log_info(f"Checking packages on {host}...")
     
     # Base packages for all nodes
     packages = [
@@ -456,8 +581,33 @@ def install_packages(host: str, is_bootstrap: bool = False):
     if is_bootstrap:
         packages.append("cephadm")
     
-    # Install packages
-    pkg_list = " ".join(packages)
+    # Check which packages are missing
+    missing_packages = []
+    for pkg in packages:
+        result = run_command(
+            f"rpm -q {pkg} &>/dev/null && echo 'installed' || echo 'missing'",
+            host=host,
+            capture_output=True,
+            check=False
+        )
+        if "missing" in result.stdout:
+            missing_packages.append(pkg)
+    
+    if not missing_packages:
+        log_info(f"  ⏭ All packages already installed on {host}, skipping")
+        # Still ensure license is accepted and chronyd is running
+        run_command(
+            "mkdir -p /usr/share/ibm-storage-ceph-license && "
+            "touch /usr/share/ibm-storage-ceph-license/accept",
+            host=host
+        )
+        run_command("systemctl enable --now chronyd 2>/dev/null || true", host=host)
+        return False
+    
+    log_info(f"  Installing {len(missing_packages)} packages on {host}: {', '.join(missing_packages)}")
+    
+    # Install missing packages
+    pkg_list = " ".join(missing_packages)
     run_command(f"dnf install -y {pkg_list}", host=host, timeout=600)
     
     # Accept IBM license
@@ -471,6 +621,7 @@ def install_packages(host: str, is_bootstrap: bool = False):
     run_command("systemctl enable --now chronyd", host=host)
     
     log_info(f"  ✓ Packages installed on {host}")
+    return True
 
 
 def configure_firewall(host: str):
@@ -514,8 +665,177 @@ def registry_login(host: str, entitlement_key: str):
     log_info(f"  ✓ Registry login successful on {host}")
 
 
+def run_parallel_on_hosts(func, hosts: list[HostInfo], *args, max_workers: int = 5, **kwargs) -> dict:
+    """
+    Run a function in parallel across multiple hosts.
+    
+    Args:
+        func: Function to execute (must accept host as first parameter)
+        hosts: List of HostInfo objects
+        *args: Additional positional arguments for func
+        max_workers: Maximum number of parallel workers
+        **kwargs: Additional keyword arguments for func
+    
+    Returns:
+        Dictionary mapping hostname to (success: bool, result/exception)
+    """
+    results = {}
+    
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(hosts))) as executor:
+        # Submit all tasks
+        future_to_host = {}
+        for host in hosts:
+            future = executor.submit(func, host.hostname, *args, **kwargs)
+            future_to_host[future] = host
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_host):
+            host = future_to_host[future]
+            try:
+                result = future.result()
+                results[host.hostname] = (True, result)
+            except Exception as e:
+                results[host.hostname] = (False, e)
+                log_error(f"  ✗ Failed on {host.hostname}: {e}")
+    
+    return results
+
+
+def configure_repositories_parallel(hosts: list[HostInfo], ceph_version: str):
+    """
+    Configure repositories on all hosts in parallel.
+    
+    Args:
+        hosts: List of hosts
+        ceph_version: Ceph major version
+    """
+    log_info(f"Configuring repositories on {len(hosts)} hosts in parallel...")
+    
+    def configure_host(hostname: str):
+        # Find the host to get OS version
+        host = next(h for h in hosts if h.hostname == hostname)
+        rhel_major = host.os_version.split('.')[0]
+        return configure_repositories(hostname, ceph_version, rhel_major)
+    
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(5, len(hosts))) as executor:
+        future_to_host = {executor.submit(configure_host, h.hostname): h for h in hosts}
+        
+        for future in as_completed(future_to_host):
+            host = future_to_host[future]
+            try:
+                result = future.result()
+                results[host.hostname] = (True, result)
+            except Exception as e:
+                results[host.hostname] = (False, e)
+                log_error(f"  ✗ Repository configuration failed on {host.hostname}: {e}")
+    
+    # Check for failures
+    failures = [h for h, (success, _) in results.items() if not success]
+    if failures:
+        raise RuntimeError(f"Repository configuration failed on: {', '.join(failures)}")
+    
+    configured = sum(1 for _, (_, was_configured) in results.items() if was_configured)
+    skipped = len(hosts) - configured
+    if skipped > 0:
+        log_info(f"  Summary: {configured} configured, {skipped} skipped (already configured)")
+
+
+def install_packages_parallel(hosts: list[HostInfo], bootstrap_hostname: str):
+    """
+    Install packages on all hosts in parallel.
+    
+    Args:
+        hosts: List of hosts
+        bootstrap_hostname: Hostname of the bootstrap node
+    """
+    log_info(f"Installing packages on {len(hosts)} hosts in parallel...")
+    
+    def install_on_host(hostname: str):
+        is_bootstrap = (hostname == bootstrap_hostname)
+        return install_packages(hostname, is_bootstrap)
+    
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(5, len(hosts))) as executor:
+        future_to_host = {executor.submit(install_on_host, h.hostname): h for h in hosts}
+        
+        for future in as_completed(future_to_host):
+            host = future_to_host[future]
+            try:
+                result = future.result()
+                results[host.hostname] = (True, result)
+            except Exception as e:
+                results[host.hostname] = (False, e)
+                log_error(f"  ✗ Package installation failed on {host.hostname}: {e}")
+    
+    # Check for failures
+    failures = [h for h, (success, _) in results.items() if not success]
+    if failures:
+        raise RuntimeError(f"Package installation failed on: {', '.join(failures)}")
+    
+    installed = sum(1 for _, (_, was_installed) in results.items() if was_installed)
+    skipped = len(hosts) - installed
+    if skipped > 0:
+        log_info(f"  Summary: {installed} installed, {skipped} skipped (already installed)")
+
+
+def configure_firewall_parallel(hosts: list[HostInfo]):
+    """
+    Configure firewall on all hosts in parallel.
+    
+    Args:
+        hosts: List of hosts
+    """
+    log_info(f"Configuring firewall on {len(hosts)} hosts in parallel...")
+    
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(5, len(hosts))) as executor:
+        future_to_host = {executor.submit(configure_firewall, h.hostname): h for h in hosts}
+        
+        for future in as_completed(future_to_host):
+            host = future_to_host[future]
+            try:
+                future.result()
+                results[host.hostname] = True
+            except Exception as e:
+                results[host.hostname] = False
+                log_error(f"  ✗ Firewall configuration failed on {host.hostname}: {e}")
+    
+    failures = [h for h, success in results.items() if not success]
+    if failures:
+        log_warn(f"  Firewall configuration failed on: {', '.join(failures)} (continuing anyway)")
+
+
+def registry_login_parallel(hosts: list[HostInfo], entitlement_key: str):
+    """
+    Perform registry login on all hosts in parallel.
+    
+    Args:
+        hosts: List of hosts
+        entitlement_key: IBM entitlement key
+    """
+    log_info(f"Logging into IBM registry on {len(hosts)} hosts in parallel...")
+    
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(5, len(hosts))) as executor:
+        future_to_host = {executor.submit(registry_login, h.hostname, entitlement_key): h for h in hosts}
+        
+        for future in as_completed(future_to_host):
+            host = future_to_host[future]
+            try:
+                future.result()
+                results[host.hostname] = True
+            except Exception as e:
+                results[host.hostname] = False
+                log_error(f"  ✗ Registry login failed on {host.hostname}: {e}")
+    
+    failures = [h for h, success in results.items() if not success]
+    if failures:
+        raise RuntimeError(f"Registry login failed on: {', '.join(failures)}")
+
+
 def bootstrap_cluster(bootstrap_host: HostInfo, mon_ip: str, entitlement_key: str,
-                      container_image: str, cluster_network: Optional[str] = None):
+                      container_image: str, cluster_network: Optional[str] = None) -> dict:
     """
     Bootstrap the Ceph cluster using cephadm.
     
@@ -525,14 +845,17 @@ def bootstrap_cluster(bootstrap_host: HostInfo, mon_ip: str, entitlement_key: st
         entitlement_key: IBM entitlement key
         container_image: Full container image path (e.g., cp.icr.io/cp/ibm-ceph/ceph-7-rhel9:latest)
         cluster_network: Optional cluster network CIDR
+    
+    Returns:
+        Dictionary with bootstrap details including dashboard credentials
     """
     log_info(f"Bootstrapping Ceph cluster on {bootstrap_host.hostname}...")
     log_info(f"  Using container image: {container_image}")
     
     # Build bootstrap command with simple/default options
+    # Note: --image must come BEFORE bootstrap subcommand
     bootstrap_cmd = [
-        "cephadm bootstrap",
-        f"--image {container_image}",
+        f"cephadm --image {container_image} bootstrap",
         f"--mon-ip {mon_ip}",
         f"--registry-url {IBM_REGISTRY_URL}",
         f"--registry-username {IBM_REGISTRY_USERNAME}",
@@ -545,17 +868,76 @@ def bootstrap_cluster(bootstrap_host: HostInfo, mon_ip: str, entitlement_key: st
     
     cmd = " ".join(bootstrap_cmd)
     
-    # Run bootstrap (this takes several minutes)
-    log_info("  This may take 5-10 minutes...")
-    result = run_command(cmd, host=bootstrap_host.hostname, timeout=900, capture_output=True)
+    # Run bootstrap with streaming output (this takes several minutes)
+    log_info("  This may take 5-10 minutes. Streaming output below:")
+    print("  " + "-" * 58)
     
-    # Print bootstrap output
-    if result.stdout:
-        print(result.stdout)
+    return_code, output = run_command_streaming(cmd, host=bootstrap_host.hostname, timeout=900)
+    
+    print("  " + "-" * 58)
+    
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, cmd)
     
     log_info("  ✓ Cluster bootstrap completed")
     
-    return result.stdout
+    # Parse bootstrap output for credentials
+    bootstrap_info = parse_bootstrap_output(output)
+    
+    return bootstrap_info
+
+
+def parse_bootstrap_output(output: str) -> dict:
+    """
+    Parse cephadm bootstrap output to extract dashboard credentials and URLs.
+    
+    Args:
+        output: Raw bootstrap command output
+    
+    Returns:
+        Dictionary with dashboard_url, dashboard_user, dashboard_password, etc.
+    """
+    info = {
+        'dashboard_url': None,
+        'dashboard_user': 'admin',
+        'dashboard_password': None,
+        'raw_output': output,
+    }
+    
+    # Pattern: Ceph Dashboard is now available at:
+    #          https://host:8443/
+    url_patterns = [
+        r'Ceph Dashboard is now available at:\s*\n\s*(https?://[^\s]+)',
+        r'dashboard.*available.*?(https?://[^\s]+)',
+        r'(https?://[\d\.]+:8443/?)',
+    ]
+    
+    for pattern in url_patterns:
+        match = re.search(pattern, output, re.IGNORECASE)
+        if match:
+            info['dashboard_url'] = match.group(1).strip()
+            break
+    
+    # Pattern: User: admin
+    #          Password: <password>
+    # Or: password: <password>
+    password_patterns = [
+        r'[Pp]assword:\s*(\S+)',
+        r'password\s+is\s+["\']?(\S+)["\']?',
+        r'User:\s*admin\s*\n\s*Password:\s*(\S+)',
+    ]
+    
+    for pattern in password_patterns:
+        match = re.search(pattern, output)
+        if match:
+            password = match.group(1).strip()
+            # Clean up any trailing punctuation
+            password = password.rstrip('.,;:')
+            if password and len(password) > 4:  # Sanity check
+                info['dashboard_password'] = password
+                break
+    
+    return info
 
 
 def distribute_ssh_keys(bootstrap_host: str, target_hosts: list[HostInfo]):
@@ -656,10 +1038,26 @@ def deploy_osds(bootstrap_host: str):
     """
     log_info("Deploying OSDs on all available devices...")
     
-    # List available devices first
+    # Refresh device inventory multiple times to ensure accurate discovery
+    # The --refresh flag doesn't instantly update, it triggers a background refresh
+    log_info("  Refreshing device inventory (this takes ~15 seconds)...")
+    
+    for attempt in range(3):
+        run_command(
+            "cephadm shell -- ceph orch device ls --refresh",
+            host=bootstrap_host,
+            capture_output=True
+        )
+        if attempt < 2:  # Don't sleep after last attempt
+            time.sleep(5)
+    
+    # Wait a bit more for the refresh to fully complete
+    time.sleep(3)
+    
+    # Now list available devices
     log_info("  Discovering available devices...")
     result = run_command(
-        "cephadm shell -- ceph orch device ls --wide --refresh",
+        "cephadm shell -- ceph orch device ls --wide",
         host=bootstrap_host,
         capture_output=True
     )
@@ -713,12 +1111,13 @@ def wait_for_cluster_health(bootstrap_host: str, timeout: int = 300):
     return False
 
 
-def get_cluster_info(bootstrap_host: str) -> dict:
+def get_cluster_info(bootstrap_host: str, bootstrap_info: Optional[dict] = None) -> dict:
     """
     Gather cluster information for final summary.
     
     Args:
         bootstrap_host: Bootstrap node hostname
+        bootstrap_info: Optional dictionary with bootstrap output (contains dashboard creds)
     
     Returns:
         Dictionary with cluster details
@@ -736,30 +1135,55 @@ def get_cluster_info(bootstrap_host: str) -> dict:
     except Exception:
         info['status'] = "Unable to retrieve"
     
-    # Dashboard URL and credentials
-    try:
-        result = run_command(
-            "cephadm shell -- ceph mgr services",
-            host=bootstrap_host,
-            capture_output=True
-        )
-        services = json.loads(result.stdout)
-        info['dashboard_url'] = services.get('dashboard', 'N/A')
-        info['prometheus_url'] = services.get('prometheus', 'N/A')
-    except Exception:
-        info['dashboard_url'] = "Unable to retrieve"
-        info['prometheus_url'] = "Unable to retrieve"
+    # Dashboard URL and credentials from bootstrap output
+    if bootstrap_info:
+        info['dashboard_url'] = bootstrap_info.get('dashboard_url')
+        info['dashboard_password'] = bootstrap_info.get('dashboard_password')
     
-    # Dashboard password (from bootstrap output file)
-    try:
-        result = run_command(
-            "cat /etc/ceph/ceph.dashboard.password 2>/dev/null || echo 'Check bootstrap output'",
-            host=bootstrap_host,
-            capture_output=True
-        )
-        info['dashboard_password'] = result.stdout.strip()
-    except Exception:
-        info['dashboard_password'] = "Check bootstrap output"
+    # If not from bootstrap output, try to get from cluster
+    if not info.get('dashboard_url'):
+        try:
+            result = run_command(
+                "cephadm shell -- ceph mgr services",
+                host=bootstrap_host,
+                capture_output=True
+            )
+            services = json.loads(result.stdout)
+            info['dashboard_url'] = services.get('dashboard', 'N/A')
+            info['prometheus_url'] = services.get('prometheus', 'N/A')
+        except Exception:
+            info['dashboard_url'] = "Unable to retrieve"
+            info['prometheus_url'] = "Unable to retrieve"
+    else:
+        # Still get prometheus URL from services
+        try:
+            result = run_command(
+                "cephadm shell -- ceph mgr services",
+                host=bootstrap_host,
+                capture_output=True
+            )
+            services = json.loads(result.stdout)
+            info['prometheus_url'] = services.get('prometheus', 'N/A')
+        except Exception:
+            info['prometheus_url'] = "Unable to retrieve"
+    
+    # Dashboard password fallback - try reading from file if not parsed from output
+    if not info.get('dashboard_password'):
+        try:
+            result = run_command(
+                "cat /etc/ceph/ceph.dashboard.password 2>/dev/null || "
+                "cephadm shell -- ceph dashboard ac-user-show admin 2>/dev/null | grep -i password || "
+                "echo ''",
+                host=bootstrap_host,
+                capture_output=True
+            )
+            password = result.stdout.strip()
+            if password:
+                info['dashboard_password'] = password
+            else:
+                info['dashboard_password'] = "See bootstrap output above"
+        except Exception:
+            info['dashboard_password'] = "See bootstrap output above"
     
     # OSD count
     try:
@@ -895,6 +1319,12 @@ Inventory file format (one per line):
         help='Skip firewall configuration'
     )
     
+    parser.add_argument(
+        '--force',
+        action='store_true',
+        help='Continue deployment even with unsupported OS version (not recommended)'
+    )
+    
     args = parser.parse_args()
     
     # Validate SSH arguments
@@ -939,16 +1369,27 @@ Inventory file format (one per line):
         current_step += 1
         log_step(current_step, total_steps, "Validating OS compatibility")
         
+        has_warnings = False
         for host in hosts:
             log_info(f"Checking {host.hostname}...")
             host.os_version = get_os_version(host.hostname)
             log_info(f"  Detected: RHEL {host.os_version}")
             
-            if not validate_os_compatibility(args.ceph_version, host.os_version, host.is_bootstrap):
+            is_compatible, is_warning = validate_os_compatibility(
+                args.ceph_version, host.os_version, host.is_bootstrap, args.force
+            )
+            
+            if not is_compatible:
                 log_error(f"OS compatibility check failed for {host.hostname}")
                 sys.exit(1)
             
-            log_info(f"  ✓ Compatible with IBM Storage Ceph {args.ceph_version}")
+            if is_warning:
+                has_warnings = True
+            else:
+                log_info(f"  ✓ Compatible with IBM Storage Ceph {args.ceph_version}")
+        
+        if has_warnings:
+            log_warn("Proceeding with unsupported OS configuration due to --force flag")
         
         # Get bootstrap node IP
         bootstrap_ip = bootstrap_host.ip_address or get_host_ip(bootstrap_host.hostname)
@@ -959,41 +1400,32 @@ Inventory file format (one per line):
         container_image = get_container_image(args.ceph_version, bootstrap_rhel_major)
         log_info(f"Container image: {container_image}")
         
-        # Step: Configure repositories
+        # Step: Configure repositories (parallel)
         current_step += 1
         log_step(current_step, total_steps, "Configuring IBM Storage Ceph repositories")
+        configure_repositories_parallel(hosts, args.ceph_version)
         
-        for host in hosts:
-            rhel_major = host.os_version.split('.')[0]
-            configure_repositories(host.hostname, args.ceph_version, rhel_major)
-        
-        # Step: Install packages
+        # Step: Install packages (parallel)
         current_step += 1
         log_step(current_step, total_steps, "Installing required packages")
+        install_packages_parallel(hosts, bootstrap_host.hostname)
         
-        for host in hosts:
-            install_packages(host.hostname, host.is_bootstrap)
-        
-        # Step: Configure firewall
+        # Step: Configure firewall (parallel)
         if not args.skip_firewall:
             current_step += 1
             log_step(current_step, total_steps, "Configuring firewall rules")
-            
-            for host in hosts:
-                configure_firewall(host.hostname)
+            configure_firewall_parallel(hosts)
         
-        # Step: Registry login
+        # Step: Registry login (parallel)
         current_step += 1
         log_step(current_step, total_steps, "Authenticating to IBM Entitled Registry")
-        
-        for host in hosts:
-            registry_login(host.hostname, args.entitlement_key)
+        registry_login_parallel(hosts, args.entitlement_key)
         
         # Step: Bootstrap cluster
         current_step += 1
         log_step(current_step, total_steps, "Bootstrapping Ceph cluster")
         
-        bootstrap_output = bootstrap_cluster(
+        bootstrap_info = bootstrap_cluster(
             bootstrap_host,
             bootstrap_ip,
             args.entitlement_key,
@@ -1027,7 +1459,7 @@ Inventory file format (one per line):
         log_step(current_step, total_steps, "Gathering cluster information")
         
         wait_for_cluster_health(bootstrap_host.hostname)
-        cluster_info = get_cluster_info(bootstrap_host.hostname)
+        cluster_info = get_cluster_info(bootstrap_host.hostname, bootstrap_info)
         print_summary(cluster_info, args.ceph_version, container_image)
         
         log_info("Deployment completed successfully!")
