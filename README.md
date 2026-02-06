@@ -278,14 +278,24 @@ A companion script `ibm_ceph_cleanup.py` is provided for complete cluster remova
 
 ## Cleanup Features
 
-The cleanup script performs these operations:
+The cleanup script uses the official `cephadm rm-cluster` command for proper cluster removal:
 
-1. **Stop Ceph Daemons** - Stops all MON, MGR, OSD, MDS, RGW services
-2. **Remove Containers** - Removes all Ceph and monitoring containers (Prometheus, Grafana, etc.)
-3. **Zap OSD Devices** - Wipes Ceph signatures and LVM from all OSD disks
-4. **Clean Directories** - Removes /etc/ceph, /var/lib/ceph, /var/log/ceph
-5. **Remove Packages** - Uninstalls cephadm, ceph-common, and related packages
-6. **Verify Ports** - Confirms Ceph ports (3300, 6789, 8443, etc.) are freed
+```bash
+cephadm rm-cluster --fsid <fsid> --zap-osds --force
+```
+
+This command is executed on each host and performs:
+
+1. **Stop & Remove Daemons** - Stops all MON, MGR, OSD, MDS, RGW, and monitoring services
+2. **Zap OSD Devices** - Wipes all LVM and partition data from OSD disks (with `--zap-osds`)
+3. **Clean Containers** - Removes all Ceph-related containers managed by cephadm
+4. **Remove Data** - Cleans /var/lib/ceph, /etc/ceph, /var/log/ceph directories
+
+After `cephadm rm-cluster`, the script also:
+- Removes any orphaned containers
+- Cleans up IBM repo files
+- Removes packages (cephadm, ceph-common, ibm-storage-ceph-license)
+- Verifies Ceph ports are freed
 
 ## Cleanup Usage
 
@@ -293,7 +303,7 @@ The cleanup script performs these operations:
 # Make executable
 chmod +x ibm_ceph_cleanup.py
 
-# Cleanup all hosts in inventory
+# Cleanup all hosts in inventory (auto-detects FSID)
 ./ibm_ceph_cleanup.py --inventory hosts.txt
 
 # Skip confirmation prompt
@@ -307,6 +317,9 @@ chmod +x ibm_ceph_cleanup.py
 
 # Cleanup single host
 ./ibm_ceph_cleanup.py --host ceph-node1
+
+# Provide FSID manually if auto-detection fails
+./ibm_ceph_cleanup.py --inventory hosts.txt --fsid a1b2c3d4-e5f6-...
 ```
 
 ## Cleanup Options
@@ -315,6 +328,7 @@ chmod +x ibm_ceph_cleanup.py
 |--------|-------------|
 | `--inventory, -i` | Path to hosts inventory file |
 | `--host` | Single host to cleanup (alternative to inventory) |
+| `--fsid` | Cluster FSID (auto-detected if not provided) |
 | `--skip-packages` | Don't remove Ceph packages (useful for reinstall) |
 | `--skip-zap` | Don't wipe OSD devices (keeps disk data) |
 | `--force, -f` | Skip confirmation prompt |
@@ -322,19 +336,50 @@ chmod +x ibm_ceph_cleanup.py
 ## Cleanup Output Example
 
 ```
-[Step 1/2] Cleaning up Ceph cluster
+[Step 1/3] Detecting cluster FSID
 ============================================================
-[INFO] Running cleanup on 3 hosts in parallel...
-[INFO] Stopping Ceph daemons on ceph-node1...
-[INFO]   Found cluster FSID: a1b2c3d4-...
-[INFO]   Stopping ceph-mon@ceph-node1.service...
-[INFO]   ✓ Ceph daemons stopped on ceph-node1
-[INFO] Removing Ceph containers on ceph-node1...
-[INFO]   Removing container: ceph-mon-ceph-node1
-[INFO]   ✓ Ceph containers removed on ceph-node1
+[INFO] Detecting cluster FSID...
+[INFO]   Found FSID from cephadm: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+
+[Step 2/3] Cleaning up Ceph cluster on all hosts
+============================================================
+
+[Host 1/3] ceph-node1
+------------------------------------------------------------
+
+  [Sub-step 1/4] Running cephadm rm-cluster (with OSD zapping)
+[INFO] Executing: cephadm rm-cluster --fsid a1b2c3d4-... --zap-osds --force
+    Disabling cephadm module...
+    Stopping ceph-mgr daemons...
+    Stopping ceph-mon daemons...
+    Stopping ceph-osd daemons...
+    Zapping OSD devices...
+    Removing data directories...
+[INFO] ✓ cephadm rm-cluster completed successfully
+
+  [Sub-step 2/4] Cleaning up remaining artifacts
+[INFO] Cleaning up remaining artifacts...
+[INFO] ✓ Artifact cleanup completed
+
+  [Sub-step 3/4] Removing Ceph packages
+[INFO] Checking installed packages...
+[INFO] Removing packages: cephadm, ceph-common, ibm-storage-ceph-license
+    Removing cephadm-18.2.0...
+    Removing ceph-common-18.2.0...
+    Removing ibm-storage-ceph-license...
+[INFO] ✓ Packages removed
+
+  [Sub-step 4/4] Verifying ports are freed
+[INFO] Verifying ports are freed...
+[INFO] ✓ All Ceph ports are freed
+[INFO] ✓ Cleanup completed successfully on ceph-node1
+------------------------------------------------------------
+
+[Host 2/3] ceph-node2
+------------------------------------------------------------
 ...
 
-[Step 2/2] Cleanup Summary
+[Step 3/3] Cleanup Summary
 ============================================================
 
 CLEANUP SUMMARY
@@ -347,6 +392,21 @@ CLEANUP SUMMARY
 Total: 3 succeeded, 0 failed
 
 Ceph cluster has been completely removed.
+```
+
+**If rm-cluster fails, the host cleanup stops immediately:**
+```
+[Host 1/3] ceph-node1
+------------------------------------------------------------
+
+  [Sub-step 1/4] Running cephadm rm-cluster (with OSD zapping)
+[INFO] Executing: cephadm rm-cluster --fsid a1b2c3d4-... --zap-osds --force
+    Error: FSID not found...
+[ERROR] cephadm rm-cluster failed with code 1
+[ERROR] Stopping cleanup for this host - cannot proceed without successful rm-cluster
+[ERROR] ✗ Cleanup failed on ceph-node1
+[ERROR]   cephadm rm-cluster failed with code 1
+------------------------------------------------------------
 ```
 
 ⚠️ **WARNING**: The cleanup script permanently destroys all Ceph data. Use with caution!
