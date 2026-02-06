@@ -139,6 +139,37 @@ ceph-node3,192.168.1.103
 | `--skip-osd` | No | Skip automatic OSD deployment |
 | `--skip-firewall` | No | Skip firewall configuration |
 | `--force` | No | Continue with unsupported OS version (not recommended) |
+| `--skip-client-setup` | No | Skip client node setup (ceph-common and config distribution) |
+
+## Inventory File Format
+
+The inventory file supports cluster nodes and client nodes:
+
+```
+# Cluster nodes (first one is bootstrap)
+ceph-node1,192.168.1.101
+ceph-node2,192.168.1.102
+ceph-node3,192.168.1.103
+
+# Client nodes - marked with 'client' keyword
+ceph-client1,192.168.1.110,client
+ceph-client2,192.168.1.111,client
+```
+
+**Client nodes:**
+- Get `ceph-common` package installed (not full Ceph stack)
+- Receive `/etc/ceph/ceph.conf` and keyring from the cluster
+- Can mount CephFS, use RBD, or access RGW
+- Are NOT added to the Ceph cluster as OSD/MON/MGR hosts
+
+JSON format also supported:
+```json
+[
+  {"hostname": "ceph-node1", "ip": "192.168.1.101"},
+  {"hostname": "ceph-node2", "ip": "192.168.1.102"},
+  {"hostname": "ceph-client1", "ip": "192.168.1.110", "role": "client"}
+]
+```
 
 ## Deployment Workflow
 
@@ -238,3 +269,84 @@ cephadm shell -- ceph health detail
 
 This tool is provided as-is for automating IBM Storage Ceph deployments.
 IBM Storage Ceph requires a valid IBM license and entitlement.
+
+---
+
+# IBM Storage Ceph Cleanup Script
+
+A companion script `ibm_ceph_cleanup.py` is provided for complete cluster removal.
+
+## Cleanup Features
+
+The cleanup script performs these operations:
+
+1. **Stop Ceph Daemons** - Stops all MON, MGR, OSD, MDS, RGW services
+2. **Remove Containers** - Removes all Ceph and monitoring containers (Prometheus, Grafana, etc.)
+3. **Zap OSD Devices** - Wipes Ceph signatures and LVM from all OSD disks
+4. **Clean Directories** - Removes /etc/ceph, /var/lib/ceph, /var/log/ceph
+5. **Remove Packages** - Uninstalls cephadm, ceph-common, and related packages
+6. **Verify Ports** - Confirms Ceph ports (3300, 6789, 8443, etc.) are freed
+
+## Cleanup Usage
+
+```bash
+# Make executable
+chmod +x ibm_ceph_cleanup.py
+
+# Cleanup all hosts in inventory
+./ibm_ceph_cleanup.py --inventory hosts.txt
+
+# Skip confirmation prompt
+./ibm_ceph_cleanup.py --inventory hosts.txt --force
+
+# Keep packages installed (for quick reinstall)
+./ibm_ceph_cleanup.py --inventory hosts.txt --skip-packages
+
+# Keep OSD disk data (don't zap devices)
+./ibm_ceph_cleanup.py --inventory hosts.txt --skip-zap
+
+# Cleanup single host
+./ibm_ceph_cleanup.py --host ceph-node1
+```
+
+## Cleanup Options
+
+| Option | Description |
+|--------|-------------|
+| `--inventory, -i` | Path to hosts inventory file |
+| `--host` | Single host to cleanup (alternative to inventory) |
+| `--skip-packages` | Don't remove Ceph packages (useful for reinstall) |
+| `--skip-zap` | Don't wipe OSD devices (keeps disk data) |
+| `--force, -f` | Skip confirmation prompt |
+
+## Cleanup Output Example
+
+```
+[Step 1/2] Cleaning up Ceph cluster
+============================================================
+[INFO] Running cleanup on 3 hosts in parallel...
+[INFO] Stopping Ceph daemons on ceph-node1...
+[INFO]   Found cluster FSID: a1b2c3d4-...
+[INFO]   Stopping ceph-mon@ceph-node1.service...
+[INFO]   ✓ Ceph daemons stopped on ceph-node1
+[INFO] Removing Ceph containers on ceph-node1...
+[INFO]   Removing container: ceph-mon-ceph-node1
+[INFO]   ✓ Ceph containers removed on ceph-node1
+...
+
+[Step 2/2] Cleanup Summary
+============================================================
+
+CLEANUP SUMMARY
+============================================================
+
+  ceph-node1: ✓ SUCCESS
+  ceph-node2: ✓ SUCCESS
+  ceph-node3: ✓ SUCCESS
+
+Total: 3 succeeded, 0 failed
+
+Ceph cluster has been completely removed.
+```
+
+⚠️ **WARNING**: The cleanup script permanently destroys all Ceph data. Use with caution!

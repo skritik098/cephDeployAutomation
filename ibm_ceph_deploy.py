@@ -93,6 +93,7 @@ class HostInfo:
     hostname: str
     ip_address: Optional[str] = None
     is_bootstrap: bool = False
+    is_client: bool = False  # Client-only node (gets ceph-common, not full cluster membership)
     os_version: Optional[str] = None
 
 
@@ -403,18 +404,23 @@ def get_container_image(ceph_version: str, rhel_major: str) -> str:
     return f"{version_images[rhel_major]}:latest"
 
 
-def parse_inventory(inventory_path: str) -> list[HostInfo]:
+def parse_inventory(inventory_path: str) -> tuple[list[HostInfo], list[HostInfo]]:
     """
     Parse hosts inventory file.
     
     Supported formats:
     - Simple: one hostname per line
     - With IP: hostname,ip_address per line
-    - JSON: [{"hostname": "...", "ip": "..."}, ...]
+    - With role: hostname,ip_address,client per line (client nodes)
+    - JSON: [{"hostname": "...", "ip": "...", "role": "client"}, ...]
     
-    First host is assumed to be the bootstrap node.
+    First non-client host is assumed to be the bootstrap node.
+    
+    Returns:
+        Tuple of (cluster_hosts, client_hosts)
     """
-    hosts = []
+    cluster_hosts = []
+    client_hosts = []
     path = Path(inventory_path)
     
     if not path.exists():
@@ -426,36 +432,60 @@ def parse_inventory(inventory_path: str) -> list[HostInfo]:
     if content.startswith('['):
         try:
             data = json.loads(content)
-            for i, item in enumerate(data):
+            first_cluster_host = True
+            for item in data:
                 if isinstance(item, str):
-                    hosts.append(HostInfo(hostname=item, is_bootstrap=(i == 0)))
+                    cluster_hosts.append(HostInfo(hostname=item, is_bootstrap=first_cluster_host))
+                    first_cluster_host = False
                 elif isinstance(item, dict):
-                    hosts.append(HostInfo(
+                    role = item.get('role', '').lower()
+                    host = HostInfo(
                         hostname=item.get('hostname', item.get('host')),
                         ip_address=item.get('ip', item.get('ip_address')),
-                        is_bootstrap=(i == 0)
-                    ))
-            return hosts
+                        is_client=(role == 'client'),
+                    )
+                    if host.is_client:
+                        client_hosts.append(host)
+                    else:
+                        host.is_bootstrap = first_cluster_host
+                        first_cluster_host = False
+                        cluster_hosts.append(host)
+            return (cluster_hosts, client_hosts)
         except json.JSONDecodeError:
             pass
     
     # Parse line-by-line format
-    for i, line in enumerate(content.splitlines()):
+    first_cluster_host = True
+    for line in content.splitlines():
         line = line.strip()
         if not line or line.startswith('#'):
             continue
         
-        parts = line.split(',')
-        hostname = parts[0].strip()
-        ip_address = parts[1].strip() if len(parts) > 1 else None
+        parts = [p.strip() for p in line.split(',')]
+        hostname = parts[0]
+        ip_address = parts[1] if len(parts) > 1 and parts[1] and not parts[1].lower() == 'client' else None
         
-        hosts.append(HostInfo(
+        # Check if this is a client node
+        is_client = False
+        for part in parts[1:]:
+            if part.lower() == 'client':
+                is_client = True
+                break
+        
+        host = HostInfo(
             hostname=hostname,
             ip_address=ip_address,
-            is_bootstrap=(i == 0)
-        ))
+            is_client=is_client,
+        )
+        
+        if is_client:
+            client_hosts.append(host)
+        else:
+            host.is_bootstrap = first_cluster_host
+            first_cluster_host = False
+            cluster_hosts.append(host)
     
-    return hosts
+    return (cluster_hosts, client_hosts)
 
 
 def setup_ssh_passwordless(hosts: list[HostInfo], ssh_password: str):
@@ -622,6 +652,108 @@ def install_packages(host: str, is_bootstrap: bool = False) -> bool:
     
     log_info(f"  ✓ Packages installed on {host}")
     return True
+
+
+def install_client_packages(host: str) -> bool:
+    """
+    Install ceph-common package on a client node.
+    
+    Args:
+        host: Target hostname
+    
+    Returns:
+        True if installation was performed, False if skipped (already installed)
+    """
+    log_info(f"Checking client packages on {host}...")
+    
+    # Check if ceph-common is already installed
+    result = run_command(
+        "rpm -q ceph-common &>/dev/null && echo 'installed' || echo 'missing'",
+        host=host,
+        capture_output=True,
+        check=False
+    )
+    
+    if "installed" in result.stdout:
+        log_info(f"  ⏭ ceph-common already installed on {host}, skipping")
+        return False
+    
+    log_info(f"  Installing ceph-common on {host}...")
+    
+    # Install ceph-common package
+    run_command("dnf install -y ceph-common", host=host, timeout=300)
+    
+    log_info(f"  ✓ ceph-common installed on {host}")
+    return True
+
+
+def setup_client_nodes(bootstrap_host: str, client_hosts: list[HostInfo]):
+    """
+    Set up client nodes with ceph-common and distribute cluster config.
+    
+    Args:
+        bootstrap_host: Bootstrap node hostname
+        client_hosts: List of client hosts
+    """
+    if not client_hosts:
+        return
+    
+    log_info(f"Setting up {len(client_hosts)} client nodes...")
+    
+    # First, install ceph-common on all client nodes in parallel
+    log_info("  Installing ceph-common on client nodes...")
+    
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(5, len(client_hosts))) as executor:
+        future_to_host = {executor.submit(install_client_packages, h.hostname): h for h in client_hosts}
+        
+        for future in as_completed(future_to_host):
+            host = future_to_host[future]
+            try:
+                result = future.result()
+                results[host.hostname] = (True, result)
+            except Exception as e:
+                results[host.hostname] = (False, e)
+                log_error(f"  ✗ Client setup failed on {host.hostname}: {e}")
+    
+    # Check for failures
+    failures = [h for h, (success, _) in results.items() if not success]
+    if failures:
+        log_warn(f"  Client package installation failed on: {', '.join(failures)}")
+    
+    # Distribute ceph.conf and keyring to client nodes
+    log_info("  Distributing cluster configuration to clients...")
+    
+    for client in client_hosts:
+        if client.hostname in failures:
+            continue
+        
+        try:
+            # Create /etc/ceph directory on client
+            run_command("mkdir -p /etc/ceph", host=client.hostname)
+            
+            # Copy ceph.conf from bootstrap node to client
+            run_command(
+                f"scp -o StrictHostKeyChecking=no /etc/ceph/ceph.conf root@{client.hostname}:/etc/ceph/",
+                host=bootstrap_host
+            )
+            
+            # Copy client keyring (read-only access)
+            # First check if a client keyring exists, otherwise create one
+            run_command(
+                "cephadm shell -- ceph auth get-or-create client.admin -o /etc/ceph/ceph.client.admin.keyring 2>/dev/null || true",
+                host=bootstrap_host
+            )
+            run_command(
+                f"scp -o StrictHostKeyChecking=no /etc/ceph/ceph.client.admin.keyring root@{client.hostname}:/etc/ceph/",
+                host=bootstrap_host
+            )
+            
+            log_info(f"  ✓ Client {client.hostname} configured")
+        except Exception as e:
+            log_error(f"  ✗ Failed to configure client {client.hostname}: {e}")
+    
+    log_info("  ✓ Client nodes setup completed")
 
 
 def configure_firewall(host: str):
@@ -1325,6 +1457,12 @@ Inventory file format (one per line):
         help='Continue deployment even with unsupported OS version (not recommended)'
     )
     
+    parser.add_argument(
+        '--skip-client-setup',
+        action='store_true',
+        help='Skip client node setup (ceph-common installation and config distribution)'
+    )
+    
     args = parser.parse_args()
     
     # Validate SSH arguments
@@ -1341,36 +1479,47 @@ Inventory file format (one per line):
         total_steps += 1
     
     current_step = 0
+    client_hosts = []  # Will be populated after parsing inventory
     
     try:
         # Step: Parse inventory
         current_step += 1
         log_step(current_step, total_steps, "Parsing inventory file")
-        hosts = parse_inventory(args.inventory)
+        cluster_hosts, client_hosts = parse_inventory(args.inventory)
         
-        if len(hosts) < 1:
-            log_error("At least one host is required in the inventory")
+        if len(cluster_hosts) < 1:
+            log_error("At least one cluster host is required in the inventory")
             sys.exit(1)
         
-        log_info(f"Found {len(hosts)} hosts in inventory:")
-        for h in hosts:
+        log_info(f"Found {len(cluster_hosts)} cluster hosts in inventory:")
+        for h in cluster_hosts:
             role = "(bootstrap)" if h.is_bootstrap else ""
             log_info(f"  • {h.hostname} {role}")
         
-        bootstrap_host = hosts[0]
+        if client_hosts:
+            log_info(f"Found {len(client_hosts)} client hosts in inventory:")
+            for h in client_hosts:
+                log_info(f"  • {h.hostname} (client)")
+            if not args.skip_client_setup:
+                total_steps += 1  # Add step for client setup
+        
+        bootstrap_host = cluster_hosts[0]
+        
+        # Combine all hosts for SSH setup
+        all_hosts = cluster_hosts + client_hosts
         
         # Step: SSH setup (optional)
         if args.setup_ssh:
             current_step += 1
             log_step(current_step, total_steps, "Setting up SSH passwordless authentication")
-            setup_ssh_passwordless(hosts, args.ssh_password)
+            setup_ssh_passwordless(all_hosts, args.ssh_password)
         
-        # Step: Validate OS compatibility
+        # Step: Validate OS compatibility (cluster hosts only)
         current_step += 1
         log_step(current_step, total_steps, "Validating OS compatibility")
         
         has_warnings = False
-        for host in hosts:
+        for host in cluster_hosts:
             log_info(f"Checking {host.hostname}...")
             host.os_version = get_os_version(host.hostname)
             log_info(f"  Detected: RHEL {host.os_version}")
@@ -1388,6 +1537,11 @@ Inventory file format (one per line):
             else:
                 log_info(f"  ✓ Compatible with IBM Storage Ceph {args.ceph_version}")
         
+        # Also get OS version for client hosts (for repo configuration)
+        for host in client_hosts:
+            host.os_version = get_os_version(host.hostname)
+            log_info(f"  Client {host.hostname}: RHEL {host.os_version}")
+        
         if has_warnings:
             log_warn("Proceeding with unsupported OS configuration due to --force flag")
         
@@ -1400,26 +1554,31 @@ Inventory file format (one per line):
         container_image = get_container_image(args.ceph_version, bootstrap_rhel_major)
         log_info(f"Container image: {container_image}")
         
-        # Step: Configure repositories (parallel)
+        # Step: Configure repositories (parallel) - cluster hosts only
         current_step += 1
         log_step(current_step, total_steps, "Configuring IBM Storage Ceph repositories")
-        configure_repositories_parallel(hosts, args.ceph_version)
+        configure_repositories_parallel(cluster_hosts, args.ceph_version)
         
-        # Step: Install packages (parallel)
+        # Also configure repos on client hosts if not skipping client setup
+        if client_hosts and not args.skip_client_setup:
+            log_info("Configuring repositories on client hosts...")
+            configure_repositories_parallel(client_hosts, args.ceph_version)
+        
+        # Step: Install packages (parallel) - cluster hosts only
         current_step += 1
         log_step(current_step, total_steps, "Installing required packages")
-        install_packages_parallel(hosts, bootstrap_host.hostname)
+        install_packages_parallel(cluster_hosts, bootstrap_host.hostname)
         
-        # Step: Configure firewall (parallel)
+        # Step: Configure firewall (parallel) - cluster hosts only
         if not args.skip_firewall:
             current_step += 1
             log_step(current_step, total_steps, "Configuring firewall rules")
-            configure_firewall_parallel(hosts)
+            configure_firewall_parallel(cluster_hosts)
         
-        # Step: Registry login (parallel)
+        # Step: Registry login (parallel) - cluster hosts only
         current_step += 1
         log_step(current_step, total_steps, "Authenticating to IBM Entitled Registry")
-        registry_login_parallel(hosts, args.entitlement_key)
+        registry_login_parallel(cluster_hosts, args.entitlement_key)
         
         # Step: Bootstrap cluster
         current_step += 1
@@ -1437,12 +1596,12 @@ Inventory file format (one per line):
         current_step += 1
         log_step(current_step, total_steps, "Expanding cluster and configuring HA")
         
-        if len(hosts) > 1:
-            distribute_ssh_keys(bootstrap_host.hostname, hosts)
-            add_hosts_to_cluster(bootstrap_host.hostname, hosts)
+        if len(cluster_hosts) > 1:
+            distribute_ssh_keys(bootstrap_host.hostname, cluster_hosts)
+            add_hosts_to_cluster(bootstrap_host.hostname, cluster_hosts)
         
         # Configure 3 MONs and MGRs for HA
-        configure_mon_mgr_placement(bootstrap_host.hostname, len(hosts))
+        configure_mon_mgr_placement(bootstrap_host.hostname, len(cluster_hosts))
         
         # Step: Deploy OSDs (optional)
         if not args.skip_osd:
@@ -1453,6 +1612,12 @@ Inventory file format (one per line):
             # Give OSDs time to start deploying
             log_info("Waiting for OSD deployment to progress...")
             time.sleep(30)
+        
+        # Step: Setup client nodes (optional)
+        if client_hosts and not args.skip_client_setup:
+            current_step += 1
+            log_step(current_step, total_steps, "Setting up client nodes")
+            setup_client_nodes(bootstrap_host.hostname, client_hosts)
         
         # Final step: Gather info and print summary
         current_step += 1
