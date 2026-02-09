@@ -288,22 +288,30 @@ def get_os_version(host: Optional[str] = None) -> str:
 def get_host_ip(host: str) -> str:
     """Get the primary IP address of a host."""
     try:
-        # Try to get the IP that would be used to reach external networks
+        # Get all IPs and parse in Python to avoid shell quoting issues with SSH
         result = run_command(
-            "hostname -I | awk '{print $1}'",
+            "hostname -I",
             host=host,
             capture_output=True
         )
-        ip = result.stdout.strip()
-        if ip:
+        output = result.stdout.strip()
+        if output:
+            # Take the first IP address
+            ip = output.split()[0]
             return ip
         
-        # Fallback: resolve hostname
+        # Fallback: resolve hostname using getent
         result = run_command(
-            f"getent hosts {host} | awk '{{print $1}}'",
+            f"getent hosts {host}",
             capture_output=True
         )
-        return result.stdout.strip()
+        output = result.stdout.strip()
+        if output:
+            # getent output format: "IP_ADDRESS hostname"
+            ip = output.split()[0]
+            return ip
+        
+        return host
     except Exception:
         log_warn(f"Could not determine IP for {host}, using hostname")
         return host
@@ -617,7 +625,7 @@ def install_packages(host: str, is_bootstrap: bool = False) -> bool:
     # Step 1: Install and accept license first (required before cephadm)
     if not license_installed:
         log_info(f"  Installing ibm-storage-ceph-license on {host}...")
-        run_command("dnf install -y ibm-storage-ceph-license | tail -n5", host=host, timeout=300)
+        run_command("dnf install -y ibm-storage-ceph-license", host=host, timeout=300)
     
     # Step 2: Accept IBM license (must be done before installing cephadm)
     log_info(f"  Accepting IBM license agreement on {host}...")
@@ -632,7 +640,6 @@ def install_packages(host: str, is_bootstrap: bool = False) -> bool:
         "podman",
         "lvm2",
         "chrony",
-        "cephadm",  # cephadm is needed on all nodes for cluster management
     ]
     
     # Bootstrap node gets cephadm (can only be installed after license is accepted)
@@ -661,7 +668,7 @@ def install_packages(host: str, is_bootstrap: bool = False) -> bool:
     if missing_packages:
         log_info(f"  Installing packages on {host}: {', '.join(missing_packages)}")
         pkg_list = " ".join(missing_packages)
-        run_command(f"dnf install -y {pkg_list} | tail -n5", host=host, timeout=600)
+        run_command(f"dnf install -y {pkg_list}", host=host, timeout=600)
     
     # Enable and start chronyd for time sync
     run_command("systemctl enable --now chronyd", host=host)
@@ -710,7 +717,7 @@ def install_client_packages(host: str) -> bool:
     # Step 1: Install and accept license first (required before ceph-common)
     if not license_installed:
         log_info(f"  Installing ibm-storage-ceph-license on {host}...")
-        run_command("dnf install -y ibm-storage-ceph-license | tail -n5", host=host, timeout=300)
+        run_command("dnf install -y ibm-storage-ceph-license", host=host, timeout=300)
     
     # Step 2: Accept IBM license
     run_command(
@@ -722,7 +729,7 @@ def install_client_packages(host: str) -> bool:
     # Step 3: Install ceph-common
     if not ceph_installed:
         log_info(f"  Installing ceph-common on {host}...")
-        run_command("dnf install -y ceph-common | tail -n5", host=host, timeout=300)
+        run_command("dnf install -y ceph-common", host=host, timeout=300)
     
     log_info(f"  ✓ Client packages installed on {host}")
     return True
