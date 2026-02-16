@@ -656,6 +656,7 @@ def install_packages(host: str, is_bootstrap: bool = False) -> bool:
         "podman",
         "lvm2",
         "chrony",
+        "cephadm",
     ]
     
     # Bootstrap node gets cephadm (can only be installed after license is accepted)
