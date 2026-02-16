@@ -4,6 +4,11 @@ IBM Storage Ceph Automated Deployment Script
 =============================================
 Automates the deployment of IBM Storage Ceph clusters on RHEL-based systems.
 
+Requirements:
+    - Python 3.7 or higher
+    - SSH access to all target hosts
+    - Root privileges on target hosts
+
 Features:
 - OS version validation against IBM supported configurations
 - Optional SSH passwordless setup for root user
@@ -15,16 +20,27 @@ Features:
 Author: Automated deployment tool
 """
 
+import sys
+
+# Check Python version first (before importing modules that may not exist in older Python)
+if sys.version_info < (3, 7):
+    print("ERROR: Python 3.7 or higher is required.")
+    print("Current version: Python {}.{}".format(sys.version_info.major, sys.version_info.minor))
+    print("\nOn RHEL 8, install Python 3.9:")
+    print("  sudo dnf install python39")
+    print("  python3.9 ibm_ceph_deploy.py ...")
+    print("\nOn RHEL 9, Python 3.9+ is already available.")
+    sys.exit(1)
+
 import argparse
 import subprocess
-import sys
 import os
 import json
 import time
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple, List, Dict
 from pathlib import Path
 
 
@@ -189,7 +205,7 @@ def run_command(cmd: str, host: Optional[str] = None, check: bool = True,
         raise
 
 
-def run_command_streaming(cmd: str, host: Optional[str] = None, timeout: int = 900) -> tuple[int, str]:
+def run_command_streaming(cmd: str, host: Optional[str] = None, timeout: int = 900) -> Tuple[int, str]:
     """
     Run a command with real-time streaming output while also capturing it.
     
@@ -318,7 +334,7 @@ def get_host_ip(host: str) -> str:
 
 
 def validate_os_compatibility(ceph_version: str, os_version: str, is_bootstrap: bool = False, 
-                              force: bool = False) -> tuple[bool, bool]:
+                              force: bool = False) -> Tuple[bool, bool]:
     """
     Validate if the OS version is compatible with the Ceph version.
     
@@ -412,7 +428,7 @@ def get_container_image(ceph_version: str, rhel_major: str) -> str:
     return f"{version_images[rhel_major]}:latest"
 
 
-def parse_inventory(inventory_path: str) -> tuple[list[HostInfo], list[HostInfo]]:
+def parse_inventory(inventory_path: str) -> Tuple[List[HostInfo], List[HostInfo]]:
     """
     Parse hosts inventory file.
     
@@ -496,7 +512,7 @@ def parse_inventory(inventory_path: str) -> tuple[list[HostInfo], list[HostInfo]
     return (cluster_hosts, client_hosts)
 
 
-def setup_ssh_passwordless(hosts: list[HostInfo], ssh_password: str):
+def setup_ssh_passwordless(hosts: List[HostInfo], ssh_password: str):
     """
     Configure SSH passwordless authentication for root user.
     
@@ -640,7 +656,6 @@ def install_packages(host: str, is_bootstrap: bool = False) -> bool:
         "podman",
         "lvm2",
         "chrony",
-        "cephadm",
     ]
     
     # Bootstrap node gets cephadm (can only be installed after license is accepted)
@@ -736,7 +751,7 @@ def install_client_packages(host: str) -> bool:
     return True
 
 
-def setup_client_nodes(bootstrap_host: str, client_hosts: list[HostInfo]):
+def setup_client_nodes(bootstrap_host: str, client_hosts: List[HostInfo]):
     """
     Set up client nodes with ceph-common and distribute cluster config.
     
@@ -846,7 +861,7 @@ def registry_login(host: str, entitlement_key: str):
     log_info(f"  ✓ Registry login successful on {host}")
 
 
-def run_parallel_on_hosts(func, hosts: list[HostInfo], *args, max_workers: int = 5, **kwargs) -> dict:
+def run_parallel_on_hosts(func, hosts: List[HostInfo], *args, max_workers: int = 5, **kwargs) -> dict:
     """
     Run a function in parallel across multiple hosts.
     
@@ -882,7 +897,7 @@ def run_parallel_on_hosts(func, hosts: list[HostInfo], *args, max_workers: int =
     return results
 
 
-def configure_repositories_parallel(hosts: list[HostInfo], ceph_version: str):
+def configure_repositories_parallel(hosts: List[HostInfo], ceph_version: str):
     """
     Configure repositories on all hosts in parallel.
     
@@ -922,7 +937,7 @@ def configure_repositories_parallel(hosts: list[HostInfo], ceph_version: str):
         log_info(f"  Summary: {configured} configured, {skipped} skipped (already configured)")
 
 
-def install_packages_parallel(hosts: list[HostInfo], bootstrap_hostname: str):
+def install_packages_parallel(hosts: List[HostInfo], bootstrap_hostname: str):
     """
     Install packages on all hosts in parallel.
     
@@ -960,7 +975,7 @@ def install_packages_parallel(hosts: list[HostInfo], bootstrap_hostname: str):
         log_info(f"  Summary: {installed} installed, {skipped} skipped (already installed)")
 
 
-def configure_firewall_parallel(hosts: list[HostInfo]):
+def configure_firewall_parallel(hosts: List[HostInfo]):
     """
     Configure firewall on all hosts in parallel.
     
@@ -987,7 +1002,7 @@ def configure_firewall_parallel(hosts: list[HostInfo]):
         log_warn(f"  Firewall configuration failed on: {', '.join(failures)} (continuing anyway)")
 
 
-def registry_login_parallel(hosts: list[HostInfo], entitlement_key: str):
+def registry_login_parallel(hosts: List[HostInfo], entitlement_key: str):
     """
     Perform registry login on all hosts in parallel.
     
@@ -1121,7 +1136,7 @@ def parse_bootstrap_output(output: str) -> dict:
     return info
 
 
-def distribute_ssh_keys(bootstrap_host: str, target_hosts: list[HostInfo]):
+def distribute_ssh_keys(bootstrap_host: str, target_hosts: List[HostInfo]):
     """
     Distribute Ceph cluster SSH public key to additional hosts.
     
@@ -1144,7 +1159,7 @@ def distribute_ssh_keys(bootstrap_host: str, target_hosts: list[HostInfo]):
     log_info("  ✓ SSH keys distributed")
 
 
-def add_hosts_to_cluster(bootstrap_host: str, hosts: list[HostInfo]):
+def add_hosts_to_cluster(bootstrap_host: str, hosts: List[HostInfo]):
     """
     Add additional hosts to the Ceph cluster.
     

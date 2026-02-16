@@ -4,6 +4,11 @@ IBM Storage Ceph Cluster Cleanup Script
 ========================================
 Completely removes IBM Storage Ceph cluster and all dependent resources.
 
+Requirements:
+    - Python 3.7 or higher
+    - SSH access to all target hosts
+    - Root privileges on target hosts
+
 This script will:
 - Use cephadm rm-cluster to properly remove all daemons and zap OSDs
 - Remove Ceph configuration and data directories
@@ -15,13 +20,25 @@ WARNING: This is a destructive operation. All data will be lost!
 Author: Automated cleanup tool
 """
 
+import sys
+
+# Check Python version first (before importing modules that may not exist in older Python)
+if sys.version_info < (3, 7):
+    print("ERROR: Python 3.7 or higher is required.")
+    print("Current version: Python {}.{}".format(sys.version_info.major, sys.version_info.minor))
+    print("\nOn RHEL 8, install Python 3.9:")
+    print("  sudo dnf install python39")
+    print("  python3.9 ibm_ceph_cleanup.py ...")
+    print("\nOn RHEL 9, Python 3.9+ is already available.")
+    sys.exit(1)
+
 import argparse
 import subprocess
-import sys
 import os
 import time
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Tuple, Optional
 from pathlib import Path
 from threading import Lock
 
@@ -142,7 +159,7 @@ def run_command(cmd: str, host: str = None, check: bool = False,
         return subprocess.CompletedProcess(full_cmd, 1, "", str(e))
 
 
-def run_command_streaming(cmd: str, host: str = None, timeout: int = 600) -> tuple[int, str]:
+def run_command_streaming(cmd: str, host: str = None, timeout: int = 600) -> Tuple[int, str]:
     """
     Run a command with real-time streaming output while also capturing it.
     
@@ -208,7 +225,7 @@ def run_command_streaming(cmd: str, host: str = None, timeout: int = 600) -> tup
         raise
 
 
-def parse_inventory(inventory_path: str) -> list[str]:
+def parse_inventory(inventory_path: str) -> List[str]:
     """
     Parse hosts inventory file.
     Returns list of hostnames.
@@ -245,7 +262,7 @@ def parse_inventory(inventory_path: str) -> list[str]:
     return hosts
 
 
-def get_cluster_fsid(hosts: list[str]) -> str:
+def get_cluster_fsid(hosts: List[str]) -> str:
     """
     Get the cluster FSID from any host in the cluster.
     
@@ -340,22 +357,20 @@ def cleanup_remaining_artifacts(host: str):
     Args:
         host: Hostname to cleanup
     """
-    log_info(f"Cleaning up remaining artifacts...")
-    
-    # Remove any orphaned containers
+    log_info(f"Removing orphaned containers...")
     run_command(
         "podman ps -aq --filter 'name=ceph' | xargs -r podman rm -f 2>/dev/null || true",
         host=host
     )
     
-    # Remove ceph directories (in case rm-cluster missed any)
+    log_info(f"Removing Ceph directories...")
     for directory in CEPH_DIRECTORIES:
         run_command(f"rm -rf {directory} 2>/dev/null || true", host=host)
     
-    # Clean up any tmp cephadm files
+    log_info(f"Removing temporary cephadm files...")
     run_command("rm -rf /tmp/cephadm-* 2>/dev/null || true", host=host)
     
-    # Remove IBM repo file
+    log_info(f"Removing IBM repository files...")
     run_command("rm -f /etc/yum.repos.d/ibm-storage-ceph*.repo 2>/dev/null || true", host=host)
     
     log_info(f"✓ Artifact cleanup completed")
@@ -371,7 +386,7 @@ def remove_packages(host: str) -> bool:
     Returns:
         True if successful, False otherwise
     """
-    log_info(f"Checking installed packages...")
+    log_info(f"Checking for installed Ceph packages...")
     
     # Check which packages are installed
     installed_packages = []
@@ -381,10 +396,11 @@ def remove_packages(host: str) -> bool:
             installed_packages.append(pkg)
     
     if not installed_packages:
-        log_info(f"No Ceph packages installed")
+        log_info(f"No Ceph packages found to remove")
         return True
     
-    log_info(f"Removing packages: {', '.join(installed_packages)}")
+    log_info(f"Found packages to remove: {', '.join(installed_packages)}")
+    log_info(f"Running dnf remove...")
     
     pkg_list = " ".join(installed_packages)
     
@@ -396,10 +412,10 @@ def remove_packages(host: str) -> bool:
         )
         
         if return_code == 0:
-            log_info(f"✓ Packages removed")
+            log_info(f"✓ Packages removed successfully")
             return True
         else:
-            log_error(f"Package removal failed")
+            log_error(f"Package removal failed with code {return_code}")
             return False
     
     except Exception as e:
@@ -407,9 +423,9 @@ def remove_packages(host: str) -> bool:
         return False
 
 
-def verify_ports_freed(host: str) -> list[int]:
+def verify_ports_freed(host: str) -> List[int]:
     """Verify Ceph ports are no longer in use."""
-    log_info(f"Verifying ports are freed...")
+    log_info(f"Checking Ceph service ports...")
     
     ports_in_use = []
     
@@ -421,9 +437,10 @@ def verify_ports_freed(host: str) -> list[int]:
         )
         if result.stdout.strip():
             ports_in_use.append(port)
-            log_warn(f"Port {port} still in use")
+            log_warn(f"  Port {port} still in use")
     
     # Check sample of OSD port range
+    log_info(f"Checking OSD port range (sampling)...")
     for port in [6800, 6850, 6900, 7000, 7100, 7200]:
         result = run_command(
             f"ss -tlnp 2>/dev/null | grep ':{port} ' | grep -v grep || true",
@@ -431,10 +448,12 @@ def verify_ports_freed(host: str) -> list[int]:
         )
         if result.stdout.strip():
             ports_in_use.append(port)
-            log_warn(f"Port {port} still in use")
+            log_warn(f"  Port {port} still in use")
     
     if not ports_in_use:
         log_info(f"✓ All Ceph ports are freed")
+    else:
+        log_warn(f"Some ports still in use: {ports_in_use}")
     
     return ports_in_use
 
@@ -442,7 +461,7 @@ def verify_ports_freed(host: str) -> list[int]:
 def cleanup_host(host: str, fsid: str, skip_packages: bool = False, 
                  skip_zap: bool = False) -> dict:
     """
-    Perform complete cleanup on a single host.
+    Perform complete cleanup on a single host with clear sub-steps.
     
     Args:
         host: Hostname to cleanup
@@ -460,8 +479,18 @@ def cleanup_host(host: str, fsid: str, skip_packages: bool = False,
         'ports_in_use': [],
     }
     
+    # Determine total sub-steps
+    total_substeps = 4  # rm-cluster, artifacts, packages, ports
+    if skip_packages:
+        total_substeps = 3
+    current_substep = 0
+    
     try:
-        # Step 1: Run cephadm rm-cluster (REQUIRED - stop if this fails)
+        # Sub-step 1: Run cephadm rm-cluster (REQUIRED - stop if this fails)
+        current_substep += 1
+        zap_msg = "with OSD zapping" if not skip_zap else "without OSD zapping"
+        print(f"\n  {Colors.CYAN}[Sub-step {current_substep}/{total_substeps}] Running cephadm rm-cluster ({zap_msg}){Colors.RESET}")
+        
         if not fsid:
             log_error(f"No FSID available, cannot proceed with cleanup")
             result['success'] = False
@@ -473,28 +502,35 @@ def cleanup_host(host: str, fsid: str, skip_packages: bool = False,
         else:
             cmd = f"cephadm rm-cluster --fsid {fsid} --zap-osds --force"
         
-        log_info(f"Running: {cmd}")
+        log_info(f"Executing: {cmd}")
         return_code, output = run_command_streaming(cmd, host=host, timeout=600)
         
         if return_code != 0:
             log_error(f"cephadm rm-cluster failed with code {return_code}")
+            log_error(f"Stopping cleanup for this host - cannot proceed without successful rm-cluster")
             result['success'] = False
             result['errors'].append(f"cephadm rm-cluster failed with code {return_code}")
-            # Stop here - do not proceed with package removal or directory cleanup
+            # Stop here - do not proceed with other steps
             return result
         
         log_info(f"✓ cephadm rm-cluster completed successfully")
         
-        # Step 2: Clean up any remaining artifacts (only if rm-cluster succeeded)
+        # Sub-step 2: Clean up remaining artifacts (only if rm-cluster succeeded)
+        current_substep += 1
+        print(f"\n  {Colors.CYAN}[Sub-step {current_substep}/{total_substeps}] Cleaning up remaining artifacts{Colors.RESET}")
         cleanup_remaining_artifacts(host)
         
-        # Step 3: Remove packages (only if rm-cluster succeeded and not skipped)
+        # Sub-step 3: Remove packages (only if rm-cluster succeeded and not skipped)
         if not skip_packages:
+            current_substep += 1
+            print(f"\n  {Colors.CYAN}[Sub-step {current_substep}/{total_substeps}] Removing Ceph packages{Colors.RESET}")
             if not remove_packages(host):
                 result['errors'].append("Package removal had issues")
                 # Don't fail the whole cleanup for package issues
         
-        # Step 4: Verify ports
+        # Sub-step 4: Verify ports
+        current_substep += 1
+        print(f"\n  {Colors.CYAN}[Sub-step {current_substep}/{total_substeps}] Verifying ports are freed{Colors.RESET}")
         result['ports_in_use'] = verify_ports_freed(host)
         
     except Exception as e:
@@ -505,7 +541,7 @@ def cleanup_host(host: str, fsid: str, skip_packages: bool = False,
     return result
 
 
-def cleanup_all_hosts(hosts: list[str], fsid: str, skip_packages: bool = False,
+def cleanup_all_hosts(hosts: List[str], fsid: str, skip_packages: bool = False,
                       skip_zap: bool = False) -> dict:
     """
     Run cleanup on all hosts sequentially for clear output tracking.
@@ -574,7 +610,7 @@ def print_summary(results: dict):
         print(f"\n{Colors.YELLOW}Some hosts had issues. Please check manually.{Colors.RESET}")
 
 
-def confirm_cleanup(hosts: list[str], fsid: str) -> bool:
+def confirm_cleanup(hosts: List[str], fsid: str) -> bool:
     """Ask user to confirm the cleanup operation."""
     print(f"\n{Colors.RED}{Colors.BOLD}WARNING: This will PERMANENTLY DELETE all Ceph data!{Colors.RESET}")
     

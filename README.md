@@ -36,18 +36,37 @@ The script automatically selects the correct container image based on your Ceph 
 
 ## Prerequisites
 
-1. **RHEL Subscription**: All nodes must be registered with Red Hat
-2. **IBM Entitlement Key**: Obtain from [MyIBM Container Library](https://myibm.ibm.com/products-services/containerlibrary)
-3. **Network Connectivity**: All nodes must be reachable from the admin workstation
-4. **Root Access**: Script requires root privileges on all nodes
+1. **Python 3.7 or higher**: Required on the machine running the scripts
+2. **RHEL Subscription**: All nodes must be registered with Red Hat
+3. **IBM Entitlement Key**: Obtain from [MyIBM Container Library](https://myibm.ibm.com/products-services/containerlibrary)
+4. **Network Connectivity**: All nodes must be reachable from the admin workstation
+5. **Root Access**: Script requires root privileges on all nodes
+6. **SSH Access**: SSH access to all target nodes as root
+
+### Python Version Check
+
+```bash
+# Check your Python version
+python3 --version
+
+# On RHEL 8 (if Python version is below 3.7):
+sudo dnf install python39
+python3.9 ibm_ceph_deploy.py ...
+
+# On RHEL 9 (Python 3.9+ is already available):
+python3 ibm_ceph_deploy.py ...
+```
 
 ## Installation
 
 ```bash
-# Make the script executable
-chmod +x ibm_ceph_deploy.py
+# Download the scripts
+# (or copy them to your admin workstation)
 
-# Verify Python 3 is available
+# Make the scripts executable
+chmod +x ibm_ceph_deploy.py ibm_ceph_cleanup.py
+
+# Verify Python version (must be 3.7+)
 python3 --version
 ```
 
@@ -241,6 +260,20 @@ cephadm shell -- ceph health detail
 ```
 
 ## Troubleshooting
+
+### Python Version Error
+If you see `ModuleNotFoundError: No module named 'dataclasses'` or `TypeError: 'type' object is not subscriptable`:
+
+```bash
+# Check your Python version
+python3 --version
+
+# If below 3.7, install Python 3.9 on RHEL 8:
+sudo dnf install python39
+
+# Run the script with Python 3.9:
+python3.9 ibm_ceph_deploy.py --inventory hosts.txt -v 7 -k <KEY>
+```
 
 ### SSH Connection Failed
 - Verify hostname resolution: `getent hosts <hostname>`
