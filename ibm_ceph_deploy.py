@@ -52,6 +52,9 @@ from pathlib import Path
 # Format: {ceph_major_version: {rhel_major: [supported_minor_versions]}}
 
 VERSION_COMPATIBILITY = {
+    "9": {
+        "9": ["9.6", "9.7"],  # RHEL 9 only for Ceph 9.x
+    },
     "8": {
         "9": ["9.4", "9.5", "9.6"],
     },
@@ -84,6 +87,9 @@ IBM_REGISTRY_USERNAME = "cp"
 # Using :latest tag pulls the most recent release in that major version stream
 # Note: Ceph 5 only has RHEL 8 based images available
 CONTAINER_IMAGES = {
+    "9": {
+        "9": "cp.icr.io/cp/ibm-ceph/ceph-9-rhel9",
+    },
     "8": {
         "9": "cp.icr.io/cp/ibm-ceph/ceph-8-rhel9",
     },
@@ -618,11 +624,11 @@ def install_packages(host: str, is_bootstrap: bool = False) -> bool:
     cephadm can be installed. The sequence is:
     1. Install ibm-storage-ceph-license
     2. Accept the license agreement
-    3. Install remaining packages (including cephadm on bootstrap)
+    3. Install remaining packages (cephadm installed on all nodes)
     
     Args:
         host: Target hostname
-        is_bootstrap: Whether this is the bootstrap node
+        is_bootstrap: Whether this is the bootstrap node (not used currently, kept for compatibility)
     
     Returns:
         True if installation was performed, False if skipped (already installed)
@@ -651,17 +657,13 @@ def install_packages(host: str, is_bootstrap: bool = False) -> bool:
         host=host
     )
     
-    # Step 3: Define remaining packages to install
+    # Step 3: Define packages to install (cephadm on all nodes)
     packages = [
         "podman",
         "lvm2",
         "chrony",
         "cephadm",
     ]
-    
-    # Bootstrap node gets cephadm (can only be installed after license is accepted)
-    if is_bootstrap:
-        packages.append("cephadm")
     
     # Check which packages are missing
     missing_packages = []
@@ -1452,8 +1454,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic deployment with inventory file (latest Ceph 7.x)
-  %(prog)s --inventory hosts.txt --ceph-version 7 --entitlement-key <KEY>
+  # Basic deployment with inventory file (latest Ceph 9.x)
+  %(prog)s --inventory hosts.txt --ceph-version 9 --entitlement-key <KEY>
 
   # With SSH setup and custom cluster network (latest Ceph 8.x)
   %(prog)s --inventory hosts.txt --ceph-version 8 --entitlement-key <KEY> \\

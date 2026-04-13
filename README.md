@@ -18,6 +18,7 @@ The script automatically selects the correct container image based on your Ceph 
 
 | Ceph Version | RHEL 9 Image | RHEL 8 Image | Notes |
 |-------------|--------------|--------------|-------|
+| **9** | `cp.icr.io/cp/ibm-ceph/ceph-9-rhel9:latest` | N/A | Latest GA |
 | **8** | `cp.icr.io/cp/ibm-ceph/ceph-8-rhel9:latest` | N/A | |
 | **7** | `cp.icr.io/cp/ibm-ceph/ceph-7-rhel9:latest` | `cp.icr.io/cp/ibm-ceph/ceph-7-rhel8:latest` | |
 | **6** | `cp.icr.io/cp/ibm-ceph/ceph-6-rhel9:latest` | `cp.icr.io/cp/ibm-ceph/ceph-6-rhel8:latest` | |
@@ -27,7 +28,8 @@ The script automatically selects the correct container image based on your Ceph 
 
 | Ceph Version | RHEL 9 Supported | RHEL 8 Supported | Notes |
 |-------------|------------------|------------------|-------|
-| **8** | 9.4, 9.5, 9.6 | ❌ | Latest GA |
+| **9** | 9.6, 9.7 | ❌ | Latest GA - RHEL 9 only |
+| **8** | 9.4, 9.5, 9.6 | ❌ | |
 | **7** | 9.2 - 9.6 | 8.7, 8.8, 8.10* | |
 | **6** | 9.2 - 9.5 | 8.8 - 8.10* | |
 | **5** | 9.0 - 9.2 | 8.6 - 8.8 | |
@@ -77,7 +79,7 @@ python3 --version
 ```bash
 ./ibm_ceph_deploy.py \
   --inventory hosts_inventory.txt \
-  --ceph-version 7 \
+  --ceph-version 9 \
   --entitlement-key <YOUR_IBM_ENTITLEMENT_KEY>
 ```
 
@@ -88,7 +90,7 @@ If SSH passwordless isn't configured yet:
 ```bash
 ./ibm_ceph_deploy.py \
   --inventory hosts_inventory.txt \
-  --ceph-version 8 \
+  --ceph-version 9 \
   --entitlement-key <YOUR_IBM_ENTITLEMENT_KEY> \
   --setup-ssh \
   --ssh-password <CURRENT_ROOT_PASSWORD>
@@ -150,7 +152,7 @@ ceph-node3,192.168.1.103
 | Option | Required | Description |
 |--------|----------|-------------|
 | `--inventory, -i` | Yes | Path to hosts inventory file |
-| `--ceph-version, -v` | Yes | IBM Storage Ceph major version (5, 6, 7, 8) - deploys latest in that stream |
+| `--ceph-version, -v` | Yes | IBM Storage Ceph major version (5, 6, 7, 8, 9) - deploys latest in that stream |
 | `--entitlement-key, -k` | Yes | IBM entitlement key for container registry |
 | `--setup-ssh` | No | Configure SSH passwordless authentication |
 | `--ssh-password` | No* | Root password for SSH setup (*required with --setup-ssh) |
